@@ -581,9 +581,142 @@ def editor(spec: dict, df: pd.DataFrame, lookups: dict, key: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Excel tab: export in the "Daily module.xlsx" layout, and import such a file
+# ----------------------------------------------------------------------------
+import difflib
+import io
+import re
+
+EXPORT_COLS = ["id", "#deliverable", "discussion_date", "due date", "Comment", "ticket", "status"]
+TICKET_RE = re.compile(r"(?:MYDSUP[\-\u2011\u2013 ]*|ticket\s*#?\s*)(\d{3,6})", re.IGNORECASE)
+PRIO_RE = re.compile(r"\(\s*priority\s*(\d)\s*\)", re.IGNORECASE)
+
+
+def sheet_name(full_name: str) -> str:
+    return re.sub(r"[\[\]:*?/\\]", "", full_name.split()[0])[:31]
+
+
+def export_workbook(items: pd.DataFrame, team: pd.DataFrame) -> bytes:
+    """One sheet per active person: id, #deliverable, discussion_date, due date, Comment, ticket, status."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for name in team["name"]:
+            mine = where(items, items["owner"] == name).sort_values("id")
+            df = pd.DataFrame({
+                "id": range(1, len(mine) + 1),
+                "#deliverable": mine["deliverable"].tolist(),
+                "discussion_date": [d.isoformat() if is_date(d) else "" for d in mine["discussed_on"]],
+                "due date": [d.isoformat() if is_date(d) else "" for d in mine["due_current"]],
+                "Comment": mine["notes"].tolist(),
+                "ticket": mine["ticket"].tolist(),
+                "status": mine["status"].tolist(),
+            })
+            df.to_excel(xw, sheet_name=sheet_name(name), index=False)
+            ws = xw.sheets[sheet_name(name)]
+            for col, w in zip("ABCDEFG", [5, 60, 16, 16, 40, 14, 12]):
+                ws.column_dimensions[col].width = w
+            ws.freeze_panes = "A2"
+    return buf.getvalue()
+
+
+def resolve_owner(sheet: str, names: list[str]) -> str | None:
+    key = sheet.strip().lower()
+    for n in names:
+        if n.lower() == key or n.lower().startswith(key) or n.split()[0].lower() == key:
+            return n
+    close = difflib.get_close_matches(key, [n.split()[0].lower() for n in names], n=1, cutoff=0.6)
+    if close:
+        return next(n for n in names if n.split()[0].lower() == close[0])
+    return None
+
+
+def find_col(cols: list[str], *needles: str) -> str | None:
+    for c in cols:
+        k = str(c).lower().replace("#", "").replace("_", " ").strip()
+        if any(nd in k for nd in needles):
+            return c
+    return None
+
+
+def parse_cell_date(v, swap_dm: bool) -> tuple[dt.date | None, str]:
+    """Returns (date, leftover text). Text cells are parsed day-first; real date cells are
+    optionally swapped when the workbook stored dd/mm as mm/dd."""
+    if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+        return None, ""
+    if isinstance(v, (dt.datetime, dt.date, pd.Timestamp)):
+        d = pd.Timestamp(v).date()
+        if swap_dm and d.day <= 12:
+            d = dt.date(d.year, d.day, d.month)
+        return d, ""
+    s = str(v).strip()
+    ts = pd.to_datetime(s, errors="coerce", dayfirst=not re.match(r"^\d{4}-\d{2}-\d{2}", s))
+    if pd.isna(ts):
+        return None, s
+    return ts.date(), ""
+
+
+def parse_upload(data: bytes, names: list[str], ticket_summaries: dict[int, str], swap_dm: bool) -> pd.DataFrame:
+    """Every non-empty row of every sheet -> one candidate deliverable with problems noted."""
+    book = pd.read_excel(io.BytesIO(data), sheet_name=None, keep_default_na=False)
+    out = []
+    for sheet, df in book.items():
+        owner = resolve_owner(sheet, names)
+        cols = list(df.columns)
+        c_del, c_disc, c_due = find_col(cols, "deliv"), find_col(cols, "discuss"), find_col(cols, "due")
+        c_com, c_tic, c_stat = find_col(cols, "comment", "note"), find_col(cols, "ticket"), find_col(cols, "status")
+        for i, r in df.iterrows():
+            raw = str(r[c_del]).replace("\xa0", " ").strip() if c_del else ""
+            if not raw and not (c_tic and str(r[c_tic]).strip()):
+                continue
+            problems = []
+            if owner is None:
+                problems.append(f"sheet '{sheet}' is not a team member")
+            if c_del is None:
+                problems.append("no deliverable column")
+            ticket = None
+            m = TICKET_RE.search(raw) or (TICKET_RE.search(str(r[c_tic])) if c_tic else None) or (re.search(r"\d{3,6}", str(r[c_tic])) if c_tic and str(r[c_tic]).strip() else None)
+            if m:
+                ticket = int(m.group(1))
+                if ticket not in ticket_summaries:
+                    problems.append(f"ticket {ticket} is not in the tickets table")
+                    ticket = None
+            notes = []
+            pm = PRIO_RE.search(raw)
+            if pm:
+                notes.append(f"Priority {pm.group(1)}")
+            text = PRIO_RE.sub("", raw)
+            text = re.sub(r"\(no ticket id\)", "", text, flags=re.IGNORECASE)
+            text = TICKET_RE.sub("", text)
+            text = re.sub(r"^[\s:\-\u2192>]+|[\s:\-\u2192>]+$", "", text).strip()
+            if "\u2192" in text:  # "deliverable -> progress note"
+                text, tail = [x.strip() for x in text.split("\u2192", 1)]
+                if tail:
+                    notes.append(tail)
+            if not text and ticket:
+                text = ticket_summaries[ticket]
+            if not text:
+                problems.append("empty deliverable")
+            disc, disc_txt = parse_cell_date(r[c_disc] if c_disc else None, swap_dm)
+            due, due_txt = parse_cell_date(r[c_due] if c_due else None, swap_dm)
+            if disc is None:
+                problems.append("no discussion date" + (f" ('{disc_txt}')" if disc_txt else ""))
+            if due_txt:
+                notes.append(f"Due: {due_txt}")
+            if c_com and str(r[c_com]).strip():
+                notes.append(str(r[c_com]).strip())
+            status = str(r[c_stat]).strip() if c_stat and str(r[c_stat]).strip() in DELIV_STATUSES else "Planned"
+            out.append({
+                "sheet": sheet, "row": int(i) + 2, "owner": owner, "deliverable": text, "discussed_on": disc,
+                "due_date": due, "ticket_id": ticket, "status": status, "notes": "; ".join(notes) or None,
+                "problem": "; ".join(problems),
+            })
+    return pd.DataFrame(out)
+
+
+# ----------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------
-tab_pulse, tab_tickets, tab_admin = st.tabs(["Team pulse", "Tickets", "Manage"])
+tab_pulse, tab_tickets, tab_admin, tab_excel = st.tabs(["Team pulse", "Tickets", "Manage", "Excel"])
 
 try:
     items, team = load()
@@ -679,6 +812,77 @@ with tab_tickets:
     if c3.button("Refresh", use_container_width=True, key="t_refresh"):
         st.cache_data.clear()
         st.rerun()
+
+def excel_tab() -> None:
+    st.markdown("**Export**", unsafe_allow_html=True)
+    st.caption("One sheet per person, same columns as Daily module.xlsx (id, #deliverable, discussion_date, due date, Comment) plus ticket and status.")
+    st.download_button(
+        "Download deliverables as Excel", export_workbook(items, team),
+        file_name=f"Daily module {today:%Y-%m-%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="x_dl",
+    )
+
+    st.markdown("**Import**", unsafe_allow_html=True)
+    if not st.session_state.get("is_admin"):
+        st.info("Importing writes to the database. Sign in on the Manage tab first.")
+        return
+    up = st.file_uploader("Upload a workbook in the Daily module layout", type=["xlsx"], key="x_up")
+    swap_dm = st.checkbox("Dates were typed as day/month but Excel stored them as month/day: swap them", value=False, key="x_swap")
+    if up is not None:
+        ticket_summaries = {int(n): s for n, s in zip(tickets["number"], tickets["summary"])}
+        try:
+            cand = parse_upload(up.getvalue(), names, ticket_summaries, swap_dm)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the workbook: {str(e).splitlines()[0]}")
+            return
+        if cand.empty:
+            st.warning("No rows with a deliverable found.")
+            return
+        existing = {(o, d.lower(), s) for o, d, s in zip(items["owner"], items["deliverable"], items["discussed_on"])}
+        cand["problem"] = [
+            p or ("already in the database" if (o, str(d).lower(), s) in existing else "")
+            for p, o, d, s in zip(cand["problem"], cand["owner"], cand["deliverable"], cand["discussed_on"])
+        ]
+        ok = cand[cand["problem"] == ""]
+        st.caption(f"{len(cand)} rows read &middot; {len(ok)} ready to insert &middot; {len(cand) - len(ok)} skipped (see Problem)", unsafe_allow_html=True)
+        st.dataframe(
+            cand[["sheet", "row", "owner", "deliverable", "discussed_on", "due_date", "ticket_id", "status", "notes", "problem"]],
+            hide_index=True, use_container_width=True,
+            column_config={
+                "discussed_on": st.column_config.DateColumn("Discussed", format="DD/MM/YYYY"),
+                "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),
+                "ticket_id": st.column_config.NumberColumn("Ticket", format="%d"),
+                "deliverable": st.column_config.TextColumn(width="large"),
+                "problem": st.column_config.TextColumn("Problem", width="medium"),
+            },
+        )
+        if st.button(f"Insert {len(ok)} row{'s' if len(ok) != 1 else ''}", disabled=ok.empty, type="primary", key="x_ins"):
+            name_to_id = {str(n): int(i) for i, n in zip(users_all["user_id"], users_all["full_name"])} if "users_all" in globals() else {}
+            if not name_to_id:
+                u = query("select user_id, full_name from users")
+                name_to_id = {str(n): int(i) for i, n in zip(u["user_id"], u["full_name"])}
+            try:
+                with conn().session as s:
+                    for _, r in ok.iterrows():
+                        s.execute(text(
+                            "insert into deliverables (user_id, deliverable, discussed_on, due_date, ticket_id, status, notes) "
+                            "values (:user_id, :deliverable, :discussed_on, :due_date, :ticket_id, :status, :notes)"
+                        ), {
+                            "user_id": name_to_id[r["owner"]], "deliverable": r["deliverable"], "discussed_on": r["discussed_on"],
+                            "due_date": r["due_date"], "ticket_id": None if pd.isna(r["ticket_id"]) else int(r["ticket_id"]),
+                            "status": r["status"], "notes": r["notes"],
+                        })
+                    s.commit()
+            except SQLAlchemyError as e:
+                st.error(f"Nothing inserted. {str(getattr(e, 'orig', e)).splitlines()[0]}")
+            else:
+                st.cache_data.clear()
+                st.success(f"Inserted {plural(len(ok), 'deliverable')}. They are on the Team pulse tab now.")
+
+
+with tab_excel:
+    excel_tab()
+
 
 with tab_admin:
     admin_pw = str(secret("admin", "password", ""))

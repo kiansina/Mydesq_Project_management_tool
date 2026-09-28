@@ -239,9 +239,9 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 .dm .dbody{display:grid;grid-template-columns:110px minmax(0,1fr);gap:4px 12px;padding:8px 12px 12px;font-size:13px;background:var(--s1);border-radius:0 0 8px 8px;margin-bottom:4px}
 .dm .dbody .k{color:var(--t2)}.dm .dbody .v{overflow-wrap:anywhere}.dm .dbody a{color:#185fa5;text-decoration:none}
 .dm .lbl{position:absolute;top:1px;font-size:11px;color:var(--t2);white-space:nowrap}
-.dm .bar.open{background:#eda100}.dm .bar.done{background:#639922}.dm .bar.late{background:#e24b4a}
+.dm .bar.open{background:var(--acc)}.dm .bar.done{background:#639922}.dm .bar.late{background:#e24b4a}
 .dm .lbl svg{width:13px;height:13px;vertical-align:-2px}
-.dm .bar.nodate{background:#eb6834}.dm .pill.nodate{background:#faece7;color:#712b13}.dm .pill svg{width:13px;height:13px;vertical-align:-2px}
+.dm .pill.nodate{background:#faece7;color:#712b13}.dm .pill svg{width:13px;height:13px;vertical-align:-2px}
 .dm .av{width:24px;height:24px;border-radius:50%;background:var(--accbg);color:var(--acct);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;flex:none}
 .dm .track{position:relative;height:18px}
 .dm .today{position:absolute;top:-4px;bottom:-4px;width:1px;background:var(--bs)}
@@ -276,7 +276,7 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 
 
 ICON = {
-    "open": '<svg viewBox="0 0 24 24" fill="none" stroke="#ba7517" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+    "open": '<svg viewBox="0 0 24 24" fill="none" stroke="#185fa5" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
     "done": '<svg viewBox="0 0 24 24" fill="none" stroke="#3b6d11" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/></svg>',
     "nodate": '<svg viewBox="0 0 24 24" fill="none" stroke="#993c1d" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.5"/></svg>',
     "late": '<svg viewBox="0 0 24 24" fill="none" stroke="#a32d2d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l10 18H2z"/><path d="M12 10v4M12 17.5v.5"/></svg>',
@@ -397,18 +397,14 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
             else:
                 h.append(f'<span class="lbl" style="right:{100 - left + 1.5}%">{lbl}</span>')
         else:
-            s = r["discussed_on"] if is_date(r["discussed_on"]) else today
-            left = pct(min(s, today))
-            h.append(f'<div class="bar nodate" style="left:{left}%;width:{max(pct(today) - left, 0.8)}%"></div>')
             h.append(f'<span class="pill nodate" style="position:absolute;left:{pct(today) + 1}%;top:-2px">{ICON["nodate"]} Needs a date</span>')
         h.append('</div></summary>')
         h.append(detail_body(r, today))
         h.append('</details>')
     h.append('<div class="end"></div>')
-    h.append('<div class="legend"><span><span class="sw" style="background:#eda100"></span>in progress</span>'
+    h.append('<div class="legend"><span><span class="sw" style="background:#2a78d6"></span>in progress</span>'
              '<span><span class="sw" style="background:#639922"></span>done</span>'
-             '<span><span class="sw" style="background:#e24b4a"></span>past due date</span>'
-             '<span><span class="sw" style="background:#eb6834"></span>no date yet</span></div></div>')
+             '<span><span class="sw" style="background:#e24b4a"></span>past due date</span></div></div>')
 
     # People
     h.append('<div class="block"><span class="h2">People</span><div class="cards">')

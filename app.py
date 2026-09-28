@@ -227,6 +227,11 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 .dm .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dm .hdr2{display:grid;grid-template-columns:minmax(0,250px) minmax(0,1fr);gap:10px;margin-top:8px}
 .dm .row2{display:grid;grid-template-columns:minmax(0,250px) minmax(0,1fr);gap:10px;align-items:center;padding:6px 0;border-top:0.5px solid var(--b)}
+.dm details.dl summary{cursor:pointer;list-style:none}.dm details.dl summary::-webkit-details-marker{display:none}
+.dm details.dl summary:hover,.dm details.dl[open] summary{background:var(--s1)}
+.dm .dbody{display:grid;grid-template-columns:110px minmax(0,1fr);gap:4px 12px;padding:8px 12px 12px;font-size:13px;background:var(--s1);border-radius:0 0 8px 8px;margin-bottom:4px}
+.dm .dbody .k{color:var(--t2)}.dm .dbody .v{overflow-wrap:anywhere}.dm .dbody a{color:#185fa5;text-decoration:none}
+.dm .lbl{position:absolute;top:1px;font-size:11px;color:var(--t2);white-space:nowrap}
 .dm .av{width:24px;height:24px;border-radius:50%;background:var(--accbg);color:var(--acct);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;flex:none}
 .dm .track{position:relative;height:18px}
 .dm .today{position:absolute;top:-4px;bottom:-4px;width:1px;background:var(--bs)}
@@ -258,6 +263,41 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 .dm .sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px}
 </style>
 """
+
+
+def detail_body(r, today: dt.date) -> str:
+    """Expanded details for one deliverable row of the timeline."""
+    due = r["due_current"]
+    if is_date(due):
+        n = (due - today).days
+        when = "today" if n == 0 else (f"in {plural(n, 'day')}" if n > 0 else f"{plural(-n, 'day')} ago")
+        due_txt = f'{esc(due.strftime("%A %d %B %Y"))} &middot; {when}'
+        orig = r.get("due_original")
+        if is_date(orig) and orig != due:
+            due_txt += f' &middot; originally {esc(orig.strftime("%d %b"))}'
+    else:
+        due_txt = "not agreed yet"
+    disc = r["discussed_on"]
+    ticket = str(r.get("ticket") or "").strip()
+    if ticket and JIRA:
+        ticket = f'<a href="{esc(JIRA)}/browse/{esc(ticket)}" target="_blank">{esc(ticket)}</a>'
+    prio = r.get("priority")
+    pairs = [
+        ("Deliverable", esc(r["deliverable"])),
+        ("Owner", esc(r["owner"])),
+        ("Discussed on", esc(disc.strftime("%A %d %B %Y")) if is_date(disc) else "&mdash;"),
+        ("Due", due_txt),
+        ("Status", esc(r["status"])),
+        ("Ticket", esc(ticket) if ticket and not JIRA else (ticket or "none")),
+    ]
+    if pd.notna(prio) and str(prio).strip() not in ("", "nan", "None"):
+        pairs.append(("Priority", f"P{int(float(prio))}"))
+    notes = str(r.get("notes") or "").strip()
+    if notes and notes.lower() != "nan":
+        pairs.append(("Notes", esc(notes)))
+    if is_date(r.get("completed_on")):
+        pairs.append(("Completed on", esc(r["completed_on"].strftime("%A %d %B %Y"))))
+    return '<div class="dbody">' + "".join(f'<span class="k">{k}</span><span class="v">{v}</span>' for k, v in pairs) + '</div>'
 
 
 def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all closed") -> str:
@@ -320,18 +360,26 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
             extra.append(esc(r["ticket"]))
         if extra:
             title += ' <span class="muted">&middot; ' + " &middot; ".join(extra) + '</span>'
-        h.append(f'<div class="row2"><span class="t" title="{esc(r["deliverable"])}">{title}</span><div class="track">')
+        h.append(f'<details class="dl"><summary class="row2"><span class="t" title="{esc(r["deliverable"])}">{title}</span><div class="track">')
         h.append(f'<div class="today" style="left:{pct(today)}%"></div>')
         if r["has_date"]:
             s = r["discussed_on"] if is_date(r["discussed_on"]) else today
             left = pct(min(s, r["due_current"]))
-            width = max(pct(r["due_current"]) - left, 0.8)
+            end = pct(r["due_current"])
+            width = max(end - left, 0.8)
             h.append(f'<div class="bar" style="left:{left}%;width:{width}%"></div>')
+            due_lbl = esc(r["due_current"].strftime("%a %d %b").replace(" 0", " "))
             if r["past"]:
-                h.append(f'<span class="pill warn" style="position:absolute;left:{min(pct(r["due_current"]) + 1, 80)}%;top:-2px">Needs a new date</span>')
+                h.append(f'<span class="pill warn" style="position:absolute;left:{min(end + 1, 70)}%;top:-2px">Needs a new date &middot; was {due_lbl}</span>')
+            elif end < 84:
+                h.append(f'<span class="lbl" style="left:{end + 1.5}%">{due_lbl}</span>')
+            else:
+                h.append(f'<span class="lbl" style="right:{100 - left + 1.5}%">{due_lbl}</span>')
         else:
             h.append(f'<span class="pill warn" style="position:absolute;left:{pct(today) + 1}%;top:-2px">Needs a date</span>')
-        h.append('</div></div>')
+        h.append('</div></summary>')
+        h.append(detail_body(r, today))
+        h.append('</details>')
     h.append('<div class="end"></div></div>')
 
     # People

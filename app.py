@@ -180,12 +180,19 @@ def compute(items: pd.DataFrame, team: pd.DataFrame, today: dt.date) -> dict:
 
     wins = where(done, done["on_time"]).sort_values("completed_on", ascending=False).head(8)
 
-    # Timeline order: person (team sheet order), then due date ascending with undated last, then priority.
+    # Timeline: open items plus items finished in the last 14 days (shown green).
+    recent = where(items, [s == "Done" and is_date(c) and c >= today - dt.timedelta(days=14)
+                           for s, c in zip(items["status"], items["completed_on"])]).copy()
+    recent["has_date"] = recent["due_current"].map(is_date)
+    recent["past"] = False
+    tl = pd.concat([open_df, recent], ignore_index=True) if len(recent) else open_df.copy()
+    tl["kind"] = ["done" if s == "Done" else ("late" if p else "open") for s, p in zip(tl["status"], tl["past"])]
+    # Order: person (team sheet order), then due date ascending with undated last, then priority.
     order = {str(n).strip(): i for i, n in enumerate(team["name"])}
-    open_df["_owner_sort"] = [order.get(o, len(order)) for o in open_df["owner"]]
-    open_df["_due_sort"] = [d if is_date(d) else dt.date(9999, 1, 1) for d in open_df["due_current"]]
-    open_df["_prio"] = pd.to_numeric(open_df["priority"], errors="coerce").fillna(99)
-    timeline = open_df.sort_values(["_owner_sort", "_due_sort", "_prio", "id"])
+    tl["_owner_sort"] = [order.get(o, len(order)) for o in tl["owner"]]
+    tl["_due_sort"] = [d if is_date(d) else dt.date(9999, 1, 1) for d in tl["due_current"]]
+    tl["_prio"] = pd.to_numeric(tl["priority"], errors="coerce").fillna(99)
+    timeline = tl.sort_values(["_owner_sort", "_due_sort", "_prio", "id"])
 
     return {
         "open": len(open_df),
@@ -232,6 +239,9 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 .dm .dbody{display:grid;grid-template-columns:110px minmax(0,1fr);gap:4px 12px;padding:8px 12px 12px;font-size:13px;background:var(--s1);border-radius:0 0 8px 8px;margin-bottom:4px}
 .dm .dbody .k{color:var(--t2)}.dm .dbody .v{overflow-wrap:anywhere}.dm .dbody a{color:#185fa5;text-decoration:none}
 .dm .lbl{position:absolute;top:1px;font-size:11px;color:var(--t2);white-space:nowrap}
+.dm .bar.open{background:#eda100}.dm .bar.done{background:#639922}.dm .bar.late{background:#e24b4a}
+.dm .lbl svg{width:13px;height:13px;vertical-align:-2px}
+.dm .bar.nodate{background:#eb6834}.dm .pill.nodate{background:#faece7;color:#712b13}.dm .pill svg{width:13px;height:13px;vertical-align:-2px}
 .dm .av{width:24px;height:24px;border-radius:50%;background:var(--accbg);color:var(--acct);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;flex:none}
 .dm .track{position:relative;height:18px}
 .dm .today{position:absolute;top:-4px;bottom:-4px;width:1px;background:var(--bs)}
@@ -263,6 +273,14 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 .dm .sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px}
 </style>
 """
+
+
+ICON = {
+    "open": '<svg viewBox="0 0 24 24" fill="none" stroke="#ba7517" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+    "done": '<svg viewBox="0 0 24 24" fill="none" stroke="#3b6d11" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/></svg>',
+    "nodate": '<svg viewBox="0 0 24 24" fill="none" stroke="#993c1d" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.5"/></svg>',
+    "late": '<svg viewBox="0 0 24 24" fill="none" stroke="#a32d2d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l10 18H2z"/><path d="M12 10v4M12 17.5v.5"/></svg>',
+}
 
 
 def detail_body(r, today: dt.date) -> str:
@@ -324,7 +342,8 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
     dated = where(tl, tl["has_date"])
     starts = [d for d in tl["discussed_on"] if is_date(d)]
     lo = min(starts + [today]) - dt.timedelta(days=3)
-    hi = (max(list(dated["due_current"]) + [today]) if len(dated) else today) + dt.timedelta(days=3)
+    ends = list(dated["due_current"]) + [c for c in tl["completed_on"] if is_date(c)]
+    hi = max(ends + [today]) + dt.timedelta(days=3)
     if (hi - lo).days < 14:
         hi = lo + dt.timedelta(days=14)
     span = (hi - lo).days
@@ -350,8 +369,9 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
     for _, r in tl.iterrows():
         if r["owner"] != cur:
             cur = r["owner"]
-            n = int((tl["owner"] == cur).sum())
-            h.append(f'<p class="grp">{esc(cur)} &middot; {n} open</p>')
+            mine = where(tl, tl["owner"] == cur)
+            n_done = int((mine["kind"] == "done").sum())
+            h.append(f'<p class="grp">{esc(cur)} &middot; {len(mine) - n_done} open' + (f' &middot; {n_done} done' if n_done else '') + '</p>')
         title = esc(r["deliverable"])
         extra = []
         if pd.notna(r.get("priority")) and str(r.get("priority")).strip() not in ("", "nan"):
@@ -362,25 +382,33 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
             title += ' <span class="muted">&middot; ' + " &middot; ".join(extra) + '</span>'
         h.append(f'<details class="dl"><summary class="row2"><span class="t" title="{esc(r["deliverable"])}">{title}</span><div class="track">')
         h.append(f'<div class="today" style="left:{pct(today)}%"></div>')
-        if r["has_date"]:
+        kind = r.get("kind", "open")
+        end_date = r["completed_on"] if kind == "done" and is_date(r.get("completed_on")) else (r["due_current"] if r["has_date"] else None)
+        if end_date is not None:
             s = r["discussed_on"] if is_date(r["discussed_on"]) else today
-            left = pct(min(s, r["due_current"]))
-            end = pct(r["due_current"])
+            left = pct(min(s, end_date))
+            end = pct(end_date)
             width = max(end - left, 0.8)
-            h.append(f'<div class="bar" style="left:{left}%;width:{width}%"></div>')
-            due_lbl = esc(r["due_current"].strftime("%a %d %b").replace(" 0", " "))
-            if r["past"]:
-                h.append(f'<span class="pill warn" style="position:absolute;left:{min(end + 1, 70)}%;top:-2px">Needs a new date &middot; was {due_lbl}</span>')
-            elif end < 84:
-                h.append(f'<span class="lbl" style="left:{end + 1.5}%">{due_lbl}</span>')
+            h.append(f'<div class="bar {kind}" style="left:{left}%;width:{width}%"></div>')
+            when = esc(end_date.strftime("%a %d %b").replace(" 0", " "))
+            lbl = ICON[kind] + {"done": " Done ", "late": " was ", "open": " "}[kind] + when
+            if end < 80:
+                h.append(f'<span class="lbl" style="left:{end + 1.5}%">{lbl}</span>')
             else:
-                h.append(f'<span class="lbl" style="right:{100 - left + 1.5}%">{due_lbl}</span>')
+                h.append(f'<span class="lbl" style="right:{100 - left + 1.5}%">{lbl}</span>')
         else:
-            h.append(f'<span class="pill warn" style="position:absolute;left:{pct(today) + 1}%;top:-2px">Needs a date</span>')
+            s = r["discussed_on"] if is_date(r["discussed_on"]) else today
+            left = pct(min(s, today))
+            h.append(f'<div class="bar nodate" style="left:{left}%;width:{max(pct(today) - left, 0.8)}%"></div>')
+            h.append(f'<span class="pill nodate" style="position:absolute;left:{pct(today) + 1}%;top:-2px">{ICON["nodate"]} Needs a date</span>')
         h.append('</div></summary>')
         h.append(detail_body(r, today))
         h.append('</details>')
-    h.append('<div class="end"></div></div>')
+    h.append('<div class="end"></div>')
+    h.append('<div class="legend"><span><span class="sw" style="background:#eda100"></span>in progress</span>'
+             '<span><span class="sw" style="background:#639922"></span>done</span>'
+             '<span><span class="sw" style="background:#e24b4a"></span>past due date</span>'
+             '<span><span class="sw" style="background:#eb6834"></span>no date yet</span></div></div>')
 
     # People
     h.append('<div class="block"><span class="h2">People</span><div class="cards">')

@@ -126,19 +126,21 @@ def load_tickets() -> tuple[pd.DataFrame, dt.date]:
                t.priority,
                coalesce(u.full_name, 'Unassigned') as assignee,
                coalesce(t.organization, '')        as organization,
-               t.created_on                        as created
+               t.created_on                        as created,
+               coalesce(t.state, 'Open')           as state
         from tickets t
         left join users u on u.user_id = t.assignee_id
         order by t.ticket_id
     """)
     t["created"] = to_dates(t["created"])
     t["number"] = pd.to_numeric(t["number"], errors="coerce").fillna(0).astype(int)
-    for c in ["key", "summary", "priority", "assignee", "organization"]:
+    for c in ["key", "summary", "priority", "assignee", "organization", "state"]:
         t[c] = t[c].astype(str).str.strip()
     t["priority"] = t["priority"].replace("", "Normal")
+    t["state"] = t["state"].replace("", "Open")
     # Columns the shared rendering code reads but the database does not store.
     t["type"] = ""
-    t["internal_status"] = "Open"
+    t["internal_status"] = ["Resolved" if st_ == "Closed" else "Open" for st_ in t["state"]]
     return t, SNAPSHOT
 
 
@@ -496,7 +498,7 @@ def render_tickets(t: pd.DataFrame, total_in_scope: int, report_date: dt.date) -
     h.append(bars("By age", by_age, f"days since created, at {report_date.strftime('%d %b')}"))
     h.append('</div>')
     if resolved:
-        h.append('<div class="legend"><span><span class="sw" style="background:var(--acc)"></span>tickets</span><span><span class="sw" style="background:var(--ok)"></span>resolved by team</span></div>')
+        h.append('<div class="legend"><span><span class="sw" style="background:var(--acc)"></span>tickets</span><span><span class="sw" style="background:var(--ok)"></span>closed</span></div>')
     h.append('</div>')
     return "".join(h)
 
@@ -514,7 +516,8 @@ def tickets_table(show: pd.DataFrame, jira: str) -> str:
         if jira:
             num = f'<a href="{esc(jira)}/browse/{esc(r["key"])}" target="_blank">{num}</a>'
         created = r["created"].strftime("%d/%m/%Y") if is_date(r["created"]) else ""
-        h.append(f'<tr{style} title="{esc(r["key"])} &middot; {esc(r["priority"])} &middot; {esc(r["type"])}"><td class="num">{num}</td><td>{esc(r["summary"])}</td><td>{esc(r["assignee"])}</td><td class="num">{created}</td><td class="r num">{int(r["age"])}</td></tr>')
+        closed = ' <span class="pill ok" style="font-size:11px;padding:1px 6px">closed</span>' if str(r.get("state", "")) == "Closed" else ""
+        h.append(f'<tr{style} title="{esc(r["key"])} &middot; {esc(r["priority"])} &middot; {esc(r.get("state", ""))}"><td class="num">{num}</td><td>{esc(r["summary"])}{closed}</td><td>{esc(r["assignee"])}</td><td class="num">{created}</td><td class="r num">{int(r["age"])}</td></tr>')
     h.append('</tbody></table>')
     h.append('<div class="legend"><span>Row tint = priority:</span>'
              + "".join(f'<span><span class="sw" style="background:{c};border:0.5px solid var(--b)"></span>{p}</span>' for p, c in PRIO_TINT.items())
@@ -559,6 +562,11 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
             db_col, v = db_pair(col, clean(val, kinds[col]))
             sets.append(f"{db_col} = :{db_col}")
             params[db_col] = v
+        if table == "deliverables" and params.get("status") == "Done" and "completed_on" not in params:
+            # Done needs a completion date: default to today unless the row already has one.
+            if not is_date(original.iloc[int(idx)].get("completed_on")):
+                sets.append("completed_on = :completed_on")
+                params["completed_on"] = dt.date.today()
         if sets:
             ops.append((f"update {table} set {', '.join(sets)} where {pk} = :pk", params))
     for row in state["added_rows"]:
@@ -571,6 +579,10 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
                 continue
             cols.append(db_col)
             params[db_col] = v
+        if table == "deliverables" and params.get("status") == "Done" and params.get("completed_on") is None:
+            if "completed_on" not in cols:
+                cols.append("completed_on")
+            params["completed_on"] = dt.date.today()
         missing = [c for c in spec["required"] if c not in params or params[c] is None]
         if missing:
             return 0, f"New row is missing: {', '.join(missing)}"
@@ -586,7 +598,12 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
                 s.execute(text(sql), params)
             s.commit()
     except SQLAlchemyError as e:
-        return 0, str(getattr(e, "orig", e)).split("\n")[0]
+        msg = str(getattr(e, "orig", e)).split("\n")[0]
+        if "deliverables_check" in msg:
+            msg = "A deliverable marked Done needs a Completed date."
+        elif "violates foreign key" in msg:
+            msg = "That row is still referenced by another table (for example a person who owns deliverables)."
+        return 0, msg
     return len(ops), None
 
 
@@ -799,7 +816,8 @@ with tab_tickets:
         return sorted(tickets[col].unique().tolist())
 
     # Filters. Empty = all.
-    g1, g2, g3, g4, g5 = st.columns([1.5, 1, 1, 1.6, 1.2])
+    g0, g1, g2, g3, g4, g5 = st.columns([0.9, 1.4, 1, 1, 1.4, 1.2])
+    f_state = g0.selectbox("State", ["Open", "Closed", "All"], key="t_state")
     f_asg = g1.multiselect("Assignee", opts("assignee"), default=[], placeholder="Everyone", key="t_asg")
     c_from = g2.date_input("Created from", value=None, format="DD/MM/YYYY", key="t_from")
     c_to = g3.date_input("Created to", value=None, format="DD/MM/YYYY", key="t_to")
@@ -807,6 +825,8 @@ with tab_tickets:
     sort_by = g5.selectbox("Sort", ["Assignee, oldest first", "Oldest first", "Newest first", "Priority", "Number"], key="t_sort")
 
     mask = [True] * len(tickets)
+    if f_state != "All":
+        mask = [ok and v == f_state for ok, v in zip(mask, tickets["state"])]
     if f_asg:
         mask = [ok and a in f_asg for ok, a in zip(mask, tickets["assignee"])]
     if c_from or c_to:
@@ -832,8 +852,8 @@ with tab_tickets:
     show = sel_t.sort_values(by=order[0], ascending=order[1])
     st.markdown(CSS + tickets_table(show, JIRA), unsafe_allow_html=True)
 
-    csv = show[["number", "key", "priority", "summary", "assignee", "created", "age"]].rename(columns={
-        "number": "No.", "key": "Key", "priority": "Priority", "summary": "Summary", "assignee": "Assignee",
+    csv = show[["number", "key", "state", "priority", "summary", "assignee", "created", "age"]].rename(columns={
+        "number": "No.", "key": "Key", "state": "State", "priority": "Priority", "summary": "Summary", "assignee": "Assignee",
         "created": "Created", "age": "Age (days)",
     })
     c1, c2, c3 = st.columns([3, 1, 1])
@@ -975,8 +995,8 @@ with tab_admin:
 
     elif which == "Tickets":
         df = query("""
-            select t.ticket_id, t.summary, t.priority, coalesce(u.full_name, 'Unassigned') as assignee,
-                   t.organization, t.created_on
+            select t.ticket_id, t.summary, t.priority, coalesce(t.state, 'Open') as state,
+                   coalesce(u.full_name, 'Unassigned') as assignee, t.organization, t.created_on
             from tickets t left join users u on u.user_id = t.assignee_id
             order by t.ticket_id
         """)
@@ -984,13 +1004,14 @@ with tab_admin:
         spec = {
             "table": "tickets", "pk": "ticket_id",
             "required": ["ticket_id", "summary"],
-            "kinds": {"ticket_id": "int", "summary": "text", "priority": "text", "assignee": "text",
+            "kinds": {"ticket_id": "int", "summary": "text", "priority": "text", "state": "text", "assignee": "text",
                       "organization": "text", "created_on": "date"},
             "to_db": {"assignee": ("assignee_id", "assignee")},
             "config": {
                 "ticket_id": st.column_config.NumberColumn("Number", format="%d", required=True, help="Jira number without the MYDSUP- prefix"),
                 "summary": st.column_config.TextColumn("Summary", width="large", required=True),
                 "priority": st.column_config.SelectboxColumn("Priority", options=PRIORITIES, default="Normal", required=True),
+                "state": st.column_config.SelectboxColumn("State", options=["Open", "Closed"], default="Open", required=True),
                 "assignee": st.column_config.SelectboxColumn("Assignee", options=list(name_to_id) + ["Unassigned"], default="Unassigned"),
                 "organization": st.column_config.TextColumn("Organization"),
                 "created_on": st.column_config.DateColumn("Created", format="DD/MM/YYYY", default=today),

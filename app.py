@@ -93,8 +93,10 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
                case when d.ticket_id is null then '' else 'MYDSUP-' || d.ticket_id end as ticket,
                cast(null as integer) as priority,
                d.discussed_on,
-               d.due_date       as due_original,
+               coalesce(d.original_due_date, d.due_date) as due_original,
                d.due_date       as due_current,
+               coalesce(d.blocked_reason, '') as blocked_reason,
+               d.planned_days,
                d.status,
                d.completed_on,
                coalesce(d.notes, '') as notes
@@ -333,7 +335,7 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
 
     # KPI tiles
     rate = "&mdash;" if m["rate"] is None else f'{m["rate"]}%'
-    rate_d = "no closures yet" if m["rate"] is None else f'{m["closed"]} closed'
+    rate_d = "no closures yet" if m["rate"] is None else f'{m["closed"]} closed &middot; {m["reliability"]}% kept their date'
     soon_d = "nothing due" if not m["due_soon"] else f'latest {fmt(m["due_soon_last"])}'
     need_d = "agree one at stand-up" if m["need_date"] else "everyone has a date"
     if m["past"]:
@@ -537,6 +539,8 @@ def clean(value, kind: str):
         return pd.to_datetime(value).date()
     if kind == "int":
         return int(float(value))
+    if kind == "float":
+        return float(value)
     if kind == "bool":
         return bool(value)
     return str(value).strip()
@@ -761,9 +765,513 @@ def parse_upload(data: bytes, names: list[str], ticket_summaries: dict[int, str]
 
 
 # ----------------------------------------------------------------------------
+# Metrics tab: team totals, workload, blocked items, per-person metrics,
+# change log and the weekly report
+# ----------------------------------------------------------------------------
+METRIC_CSS = """
+<style>
+.dm .mgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px 8px;margin-top:12px}
+.dm .mgrid .l{font-size:11px;color:var(--t3);line-height:1.2}.dm .mgrid .v{font-size:15px;font-weight:500}
+.dm .pcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px;margin-top:8px}
+.dm .tbl td.c,.dm .tbl th.c{text-align:center}
+.dm .tbl td.c small{color:var(--t2);font-size:11px}
+</style>
+"""
+
+METRIC_LABELS = [
+    ("total", "Total"), ("committed", "Committed"), ("uncommitted", "No date yet"), ("completed", "Completed"),
+    ("on_time", "On time"), ("delayed", "Delayed"), ("rate", "On-time rate"), ("avg_delay", "Average delay"),
+    ("wip", "In progress"), ("cycle", "Cycle time"), ("aging", "Oldest open"), ("tickets", "Open tickets"),
+    ("reliability", "Kept their date"), ("variance", "Schedule variance"), ("blocked", "Blocked"), ("planned", "Planned days open"),
+]
+METRIC_HELP = {
+    "total": "All deliverables except cancelled ones",
+    "committed": "Deliverables that have a due date",
+    "uncommitted": "Open deliverables without a due date",
+    "completed": "Status Done",
+    "on_time": "Done on or before the due date",
+    "delayed": "Done after the due date, plus open ones past their date",
+    "rate": "On time / completed that had a due date",
+    "avg_delay": "Average days late, over delayed items only",
+    "wip": "Open right now (Planned, In progress, Blocked)",
+    "cycle": "Average days from discussed to completed",
+    "aging": "Days since the oldest open item was discussed",
+    "tickets": "Tickets in state Open assigned to the person",
+    "reliability": "Committed deliverables whose due date never moved",
+    "variance": "Average of completed date minus the first promised date; negative = early",
+    "blocked": "Open deliverables with status Blocked",
+    "planned": "Sum of planned days over open deliverables",
+}
+
+
+def day_diff(a, b):
+    return (b - a).days if is_date(a) and is_date(b) else None
+
+
+def avg(values) -> float | None:
+    vals = [v for v in values if v is not None]
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+def metrics_for(df: pd.DataFrame, open_tickets: int, today: dt.date) -> dict:
+    live = where(df, df["status"] != "Cancelled")
+    open_ = where(live, live["status"].isin(OPEN_STATUSES))
+    done = where(live, [s == "Done" and is_date(c) for s, c in zip(live["status"], live["completed_on"])])
+    committed = where(live, [is_date(d) for d in live["due_current"]])
+    done_due = where(done, [is_date(d) for d in done["due_current"]])
+    on_time = sum(1 for c, d in zip(done_due["completed_on"], done_due["due_current"]) if c <= d)
+    late_done = [day_diff(d, c) for c, d in zip(done_due["completed_on"], done_due["due_current"]) if c > d]
+    late_open = [day_diff(d, today) for d in open_["due_current"] if is_date(d) and d < today]
+    kept = sum(1 for o, d in zip(committed["due_original"], committed["due_current"]) if not is_date(o) or o == d)
+    variance = [day_diff(o, c) for o, c in zip(done["due_original"], done["completed_on"]) if is_date(o)]
+    ages = [day_diff(a, today) for a in open_["discussed_on"] if is_date(a)]
+    planned = float(pd.to_numeric(open_["planned_days"], errors="coerce").fillna(0).sum()) if len(open_) else 0.0
+    return {
+        "total": len(live), "committed": len(committed),
+        "uncommitted": sum(1 for d in open_["due_current"] if not is_date(d)),
+        "completed": len(done), "on_time": on_time,
+        "delayed": len(late_done) + len(late_open), "delayed_open": len(late_open),
+        "rate": round(100 * on_time / len(done_due)) if len(done_due) else None,
+        "avg_delay": avg(late_done + late_open),
+        "wip": len(open_),
+        "cycle": avg([day_diff(a, c) for a, c in zip(done["discussed_on"], done["completed_on"])]),
+        "aging": max(ages) if ages else None,
+        "tickets": open_tickets,
+        "reliability": round(100 * kept / len(committed)) if len(committed) else None,
+        "variance": avg(variance),
+        "blocked": sum(1 for s in open_["status"] if s == "Blocked"),
+        "planned": round(planned, 1),
+        "seg": {
+            "done": len(done) - len(late_done),
+            "done_late": len(late_done),
+            "open": sum(1 for d in open_["due_current"] if is_date(d) and d >= today),
+            "late": len(late_open),
+            "nodate": sum(1 for d in open_["due_current"] if not is_date(d)),
+        },
+    }
+
+
+def show_metric(key: str, m: dict) -> str:
+    v = m.get(key)
+    if v is None:
+        return "&mdash;"
+    if key in ("rate", "reliability"):
+        return f"{v}%"
+    if key in ("avg_delay", "cycle", "aging"):
+        return f"{v:g} d"
+    if key == "variance":
+        return f"{v:+g} d"
+    if key == "planned":
+        return f"{v:g} d" if v else "&mdash;"
+    return str(v)
+
+
+def open_ticket_counts(tickets: pd.DataFrame) -> dict[str, int]:
+    op = where(tickets, tickets["state"] == "Open") if "state" in tickets.columns else tickets
+    return {str(k): int(v) for k, v in op["assignee"].value_counts().items()}
+
+
+def render_team_metrics(team_m: dict, today: dt.date) -> str:
+    h = ['<div class="dm">']
+    h.append(f'<div class="top"><span class="h1">Team metrics</span><span class="muted">{today.strftime("%a %d %b %Y")}</span></div>')
+    h.append('<div class="kpis">')
+    tiles = [
+        ("Total deliverables", "total", f'{team_m["committed"]} committed &middot; {team_m["uncommitted"]} without a date'),
+        ("Completed", "completed", f'{team_m["on_time"]} on time'),
+        ("On-time rate", "rate", "of completed with a due date"),
+        ("Delayed", "delayed", f'{team_m["delayed_open"]} still open'),
+        ("Kept their date", "reliability", "due date never moved"),
+        ("Cycle time", "cycle", "discussed to completed"),
+    ]
+    for label, key, sub in tiles:
+        h.append(f'<div class="kpi"><p class="l">{label}</p><p class="v">{show_metric(key, team_m)}</p><p class="d">{sub}</p></div>')
+    h.append('</div></div>')
+    return "".join(h)
+
+
+WEEK_COLS = ["Past date", "This week", "Next week", "In 2 weeks", "In 3 weeks", "Later", "No date"]
+LOAD_TINT = {1: "#e6f1fb", 2: "#cde2fb", 3: "#b5d4f4"}
+
+
+def week_bucket(due, today: dt.date) -> str:
+    if not is_date(due):
+        return "No date"
+    if due < today:
+        return "Past date"
+    monday = today - dt.timedelta(days=today.weekday())
+    n = (due - monday).days // 7
+    return WEEK_COLS[1 + n] if n <= 3 else "Later"
+
+
+def workload(items: pd.DataFrame, names: list[str], today: dt.date) -> pd.DataFrame:
+    open_ = where(items, items["status"].isin(OPEN_STATUSES)).copy()
+    open_["bucket"] = [week_bucket(d, today) for d in open_["due_current"]]
+    open_["planned"] = pd.to_numeric(open_["planned_days"], errors="coerce").fillna(0) if len(open_) else []
+    rows = []
+    for n in names:
+        mine = where(open_, open_["owner"] == n)
+        row = {"owner": n}
+        for c in WEEK_COLS:
+            b = where(mine, mine["bucket"] == c)
+            row[c] = (len(b), float(b["planned"].sum()) if len(b) else 0.0)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_workload(wl: pd.DataFrame) -> str:
+    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Workload</span><span class="muted">open deliverables by week of due date &middot; d = planned days</span></div>']
+    h.append('<table class="tbl"><colgroup><col>' + '<col style="width:76px">' * len(WEEK_COLS) + '</colgroup>')
+    h.append('<thead><tr><th>Person</th>' + "".join(f'<th class="c">{c}</th>' for c in WEEK_COLS) + '</tr></thead><tbody>')
+    for _, r in wl.iterrows():
+        h.append(f'<tr><td>{esc(r["owner"])}</td>')
+        for c in WEEK_COLS:
+            n, d = r[c]
+            if not n:
+                h.append('<td class="c" style="color:var(--t3)">&middot;</td>')
+                continue
+            tint = "#fcebeb" if c == "Past date" else ("#faece7" if c == "No date" else LOAD_TINT.get(n, "#86b6ef"))
+            extra = f' <small>{d:g}d</small>' if d else ""
+            h.append(f'<td class="c" style="background:{tint}">{n}{extra}</td>')
+        h.append('</tr>')
+    h.append('</tbody></table></div></div>')
+    return "".join(h)
+
+
+def blocked_since(items: pd.DataFrame, changes: pd.DataFrame) -> dict[int, dt.date]:
+    out = {}
+    if len(changes):
+        b = where(changes, [(f == "status" and n == "Blocked") for f, n in zip(changes["field"], changes["new_value"])])
+        for did, when in zip(b["deliverable_id"], b["changed_at"]):
+            d = pd.to_datetime(when, errors="coerce", utc=True)
+            if pd.notna(d) and (int(did) not in out or d.date() > out[int(did)]):
+                out[int(did)] = d.date()
+    return out
+
+
+def render_blocked(items: pd.DataFrame, changes: pd.DataFrame, today: dt.date) -> str:
+    blocked = where(items, items["status"] == "Blocked")
+    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Blocked items</span><span class="muted">issue log</span></div>']
+    if not len(blocked):
+        h.append('<p class="sec" style="margin-top:8px">Nothing is blocked.</p></div></div>')
+        return "".join(h)
+    since = blocked_since(items, changes)
+    h.append('<table class="tbl"><colgroup><col style="width:150px"><col><col><col style="width:80px"></colgroup>')
+    h.append('<thead><tr><th>Owner</th><th>Deliverable</th><th>Reason</th><th class="r">Blocked</th></tr></thead><tbody>')
+    for _, r in blocked.iterrows():
+        start = since.get(int(r["id"]))
+        n = day_diff(start, today)
+        reason = str(r.get("blocked_reason") or "").strip() or '<span style="color:var(--t3)">no reason given</span>'
+        h.append(f'<tr><td>{esc(r["owner"])}</td><td>{esc(r["deliverable"])}</td><td>{reason if reason.startswith("<span") else esc(reason)}</td><td class="r num">{f"{n} d" if n is not None else "&mdash;"}</td></tr>')
+    h.append('</tbody></table></div></div>')
+    return "".join(h)
+
+
+def render_person_cards(per: list[tuple[str, str, dict]]) -> str:
+    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Per person</span><span class="muted">hover a label for its definition</span></div><div class="pcards">']
+    for name, ini, m in per:
+        h.append(f'<div class="card"><div class="who"><div class="av">{esc(ini)}</div><div><p class="n">{esc(name)}</p><p class="s">{m["wip"]} open &middot; {m["completed"]} completed</p></div></div><div class="mgrid">')
+        for key, label in METRIC_LABELS:
+            h.append(f'<div title="{esc(METRIC_HELP[key])}"><p class="l">{label}</p><p class="v">{show_metric(key, m)}</p></div>')
+        h.append('</div></div>')
+    h.append('</div></div></div>')
+    return "".join(h)
+
+
+def render_changes(changes: pd.DataFrame, limit: int = 30) -> str:
+    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Change log</span><span class="muted">due dates and statuses, newest first</span></div>']
+    if not len(changes):
+        h.append('<p class="sec" style="margin-top:8px">No changes recorded yet. Every change of a due date or status from now on appears here.</p></div></div>')
+        return "".join(h)
+    h.append('<table class="tbl"><colgroup><col style="width:92px"><col style="width:130px"><col><col style="width:72px"><col style="width:170px"><col style="width:120px"></colgroup>')
+    h.append('<thead><tr><th>When</th><th>Owner</th><th>Deliverable</th><th>Field</th><th>Change</th><th>Reason</th></tr></thead><tbody>')
+    for _, r in changes.head(limit).iterrows():
+        when = pd.to_datetime(r["changed_at"], errors="coerce", utc=True)
+        when_s = when.strftime("%d %b %H:%M") if pd.notna(when) else ""
+        old = esc(r["old_value"]) or "none"
+        new = esc(r["new_value"]) or "none"
+        h.append(f'<tr><td class="num">{when_s}</td><td>{esc(r["owner"])}</td><td>{esc(r["deliverable"])}</td><td>{esc(str(r["field"]).replace("_", " "))}</td><td>{old} &rarr; {new}</td><td>{esc(r["reason"])}</td></tr>')
+    h.append('</tbody></table></div></div>')
+    return "".join(h)
+
+
+def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m: dict, changes: pd.DataFrame, today: dt.date) -> bytes:
+    """Excel workbook: Summary, People, Done this week, Delayed, Due next 7 days, Blocked, No date, Changes."""
+    week_ago = today - dt.timedelta(days=7)
+    cols = ["owner", "deliverable", "ticket", "status", "discussed_on", "due_original", "due_current", "completed_on", "planned_days", "blocked_reason", "notes"]
+    nice = {"owner": "Owner", "deliverable": "Deliverable", "ticket": "Ticket", "status": "Status", "discussed_on": "Discussed",
+            "due_original": "First due date", "due_current": "Due date", "completed_on": "Completed", "planned_days": "Planned days",
+            "blocked_reason": "Blocked reason", "notes": "Notes"}
+    open_ = where(items, items["status"].isin(OPEN_STATUSES))
+    sheets = {
+        "Done this week": where(items, [s == "Done" and is_date(c) and c >= week_ago for s, c in zip(items["status"], items["completed_on"])]),
+        "Delayed": where(open_, [is_date(d) and d < today for d in open_["due_current"]]),
+        "Due next 7 days": where(open_, [is_date(d) and today <= d <= today + dt.timedelta(days=7) for d in open_["due_current"]]),
+        "Blocked": where(open_, open_["status"] == "Blocked"),
+        "No date": where(open_, [not is_date(d) for d in open_["due_current"]]),
+    }
+    summary = pd.DataFrame(
+        [("Report date", today.isoformat()), ("Period", f"{week_ago.isoformat()} to {today.isoformat()}")]
+        + [(label, show_metric(key, team_m).replace("&mdash;", "-")) for key, label in METRIC_LABELS if key != "tickets"]
+        + [(name, len(df)) for name, df in sheets.items()],
+        columns=["Item", "Value"],
+    )
+    people = pd.DataFrame([{"Person": n, **{label: show_metric(key, m).replace("&mdash;", "-") for key, label in METRIC_LABELS}} for n, _, m in per])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        summary.to_excel(xw, sheet_name="Summary", index=False)
+        people.to_excel(xw, sheet_name="People", index=False)
+        for name, df in sheets.items():
+            out = df[cols].rename(columns=nice).sort_values(["Owner", "Due date"], na_position="last") if len(df) else pd.DataFrame(columns=[nice[c] for c in cols])
+            out.to_excel(xw, sheet_name=name, index=False)
+        if len(changes):
+            ch = changes.copy()
+            ch["changed_at"] = pd.to_datetime(ch["changed_at"], errors="coerce", utc=True)
+            ch = ch[ch["changed_at"] >= pd.Timestamp(week_ago, tz="UTC")]
+            ch["changed_at"] = ch["changed_at"].dt.strftime("%Y-%m-%d %H:%M")
+            ch[["changed_at", "owner", "deliverable", "field", "old_value", "new_value", "reason"]].to_excel(xw, sheet_name="Changes", index=False)
+        for ws in xw.sheets.values():
+            for col in ws.columns:
+                width = max(len(str(c.value)) if c.value is not None else 0 for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 60)
+            ws.freeze_panes = "A2"
+    return buf.getvalue()
+
+
+PEOPLE_CSS = """
+<style>
+.dm .phead,.dm .prow{display:grid;grid-template-columns:190px minmax(0,1fr) 118px 118px;gap:16px;align-items:center}
+.dm .phead{font-size:12px;color:var(--t2);padding:8px 0 6px}
+.dm .prow{padding:11px 0;border-top:0.5px solid var(--b)}
+.dm .pname{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dm .chip{display:inline-flex;gap:4px;align-items:center;font-size:12px;padding:2px 8px;border-radius:8px;margin-top:3px;white-space:nowrap}
+.dm .chip svg{width:13px;height:13px}
+.dm .chip.good{background:#eaf3de;color:#27500a}.dm .chip.watch{background:#faeeda;color:#633806}
+.dm .chip.bad{background:#fcebeb;color:#791f1f}.dm .chip.none{background:var(--s1);color:var(--t2)}
+.dm .stackrow{display:flex;align-items:center;gap:8px}
+.dm .stack{display:flex;height:12px;gap:2px;min-width:2px}
+.dm .stack span{display:block;height:12px;min-width:3px}
+.dm .stack span:first-child{border-radius:2px 0 0 2px}.dm .stack span:last-child{border-radius:0 4px 4px 0}
+.dm .cnt{font-size:12px;color:var(--t2);white-space:nowrap}
+.dm .meter{position:relative;height:8px;background:var(--s1);border-radius:4px;margin-top:4px}
+.dm .meter i{position:absolute;left:0;top:0;height:8px;border-radius:4px}
+.dm .mval{font-size:13px;font-weight:500}.dm .mnone{font-size:12px;color:var(--t3)}
+.dm .drow{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:10px;align-items:center;padding:5px 0;border-top:0.5px solid var(--b)}
+.dm .dtrack{position:relative;height:18px}
+.dm .dzero{position:absolute;left:50%;top:-5px;bottom:-5px;width:1px;background:var(--bs)}
+.dm .dbar{position:absolute;top:4px;height:10px}
+.dm .dlbl{position:absolute;top:1px;font-size:11px;color:var(--t2);white-space:nowrap}
+.dm .daxis{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:10px;font-size:11px;color:var(--t3);margin-top:8px}
+.dm .daxis div{display:flex;justify-content:space-between}
+.dm .why{font-size:13px;color:var(--t2);margin:6px 0 0;padding-left:16px}.dm .why li{margin:2px 0}
+.dm .panel{background:var(--s2);border:0.5px solid var(--b);border-radius:12px;padding:14px 16px;margin-top:8px}
+</style>
+"""
+
+SEGMENTS = [
+    ("done", "Done on time", "#639922"),
+    ("done_late", "Done late", "#eda100"),
+    ("open", "In progress", "#2a78d6"),
+    ("late", "Past due date", "#e24b4a"),
+    ("nodate", "No date yet", "#b4b2a9"),
+]
+CHIP_ICON = {
+    "good": '<svg viewBox="0 0 24 24" fill="none" stroke="#3b6d11" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/></svg>',
+    "watch": '<svg viewBox="0 0 24 24" fill="none" stroke="#854f0b" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.5"/></svg>',
+    "bad": '<svg viewBox="0 0 24 24" fill="none" stroke="#a32d2d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l10 18H2z"/><path d="M12 10v4M12 17.5v.5"/></svg>',
+    "none": '<svg viewBox="0 0 24 24" fill="none" stroke="#898781" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>',
+}
+CHIP_TEXT = {"good": "On track", "watch": "Watch", "bad": "Needs attention", "none": "No data yet"}
+
+
+def verdict(m: dict) -> tuple[str, list[str]]:
+    """Traffic-light reading of one person's metrics, with the reasons in plain words."""
+    if not m["total"]:
+        return "none", ["No deliverables recorded yet."]
+    bad, watch, good = [], [], []
+    if m["delayed_open"]:
+        bad.append(f'{plural(m["delayed_open"], "open deliverable")} past the due date.')
+    if m["rate"] is not None and m["completed"] >= 2 and m["rate"] < 60:
+        bad.append(f'Only {m["rate"]}% of completed work was on time.')
+    if m["blocked"] >= 2:
+        bad.append(f'{m["blocked"]} deliverables are blocked.')
+    if m["rate"] is not None and 60 <= m["rate"] < 80:
+        watch.append(f'{m["rate"]}% of completed work was on time.')
+    if m["reliability"] is not None and m["reliability"] < 70:
+        watch.append(f'Due dates were moved on {100 - m["reliability"]}% of committed deliverables.')
+    if m["uncommitted"]:
+        watch.append(f'{plural(m["uncommitted"], "deliverable")} without a due date.')
+    if m["blocked"] == 1:
+        watch.append("1 deliverable is blocked.")
+    if m["seg"]["done_late"] and not bad:
+        watch.append(f'{plural(m["seg"]["done_late"], "deliverable")} finished late.')
+    if m["rate"] is not None and m["rate"] >= 80:
+        good.append(f'{m["rate"]}% of completed work was on time.')
+    if m["seg"]["open"]:
+        good.append(f'{plural(m["seg"]["open"], "deliverable")} in progress and inside the due date.')
+    if m["reliability"] is not None and m["reliability"] >= 90 and m["committed"]:
+        good.append("Due dates were kept as first promised.")
+    if bad:
+        return "bad", bad + watch
+    if watch:
+        return "watch", watch + good
+    return "good", good or ["Nothing late, nothing blocked."]
+
+
+def chip(kind: str) -> str:
+    return f'<span class="chip {kind}">{CHIP_ICON[kind]}{CHIP_TEXT[kind]}</span>'
+
+
+def meter(value, good_from: int = 80, watch_from: int = 60, none_text: str = "no closures yet") -> str:
+    if value is None:
+        return f'<span class="mnone">{none_text}</span>'
+    color = "#639922" if value >= good_from else ("#eda100" if value >= watch_from else "#e24b4a")
+    return f'<span class="mval">{value}%</span><div class="meter"><i style="width:{max(value, 2)}%;background:{color}"></i></div>'
+
+
+def stacked(m: dict, scale: int) -> str:
+    total = sum(m["seg"].values())
+    if not total:
+        return '<span class="mnone">no deliverables</span>'
+    h = [f'<div class="stackrow"><div class="stack" style="width:{round(88 * total / max(scale, 1), 1)}%">']
+    for key, label, color in SEGMENTS:
+        n = m["seg"][key]
+        if n:
+            h.append(f'<span title="{label}: {n}" style="flex:{n} 1 0;background:{color}"></span>')
+    h.append(f'</div><span class="cnt">{total}</span></div>')
+    return "".join(h)
+
+
+def legend_segments() -> str:
+    return '<div class="legend" style="flex-wrap:wrap">' + "".join(
+        f'<span><span class="sw" style="background:{c}"></span>{label.lower()}</span>' for _, label, c in SEGMENTS) + '</div>'
+
+
+def render_people_overview(per: list[tuple[str, str, dict]]) -> str:
+    scale = max([sum(m["seg"].values()) for _, _, m in per] + [1])
+    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">People at a glance</span><span class="muted">bar length = number of deliverables</span></div>']
+    h.append('<div class="phead"><span>Person</span><span>Deliverables by state</span><span title="Completed on or before the due date">On time</span><span title="Due date never moved after the first promise">Kept their date</span></div>')
+    for name, ini, m in per:
+        kind, _ = verdict(m)
+        h.append('<div class="prow">')
+        h.append(f'<div style="display:flex;gap:10px;align-items:center"><div class="av" style="width:34px;height:34px;font-size:12px">{esc(ini)}</div><div style="min-width:0"><p class="pname" title="{esc(name)}">{esc(name)}</p>{chip(kind)}</div></div>')
+        h.append(f'<div>{stacked(m, scale)}</div>')
+        h.append(f'<div>{meter(m["rate"])}</div>')
+        h.append(f'<div>{meter(m["reliability"], 90, 70, "no dates yet")}</div>')
+        h.append('</div>')
+    h.append('<div class="end"></div>' + legend_segments() + '</div></div>')
+    return "".join(h)
+
+
+def schedule_rows(df: pd.DataFrame, today: dt.date) -> list[dict]:
+    """Days against the due date for every dated deliverable: negative = ahead, positive = late."""
+    rows = []
+    for _, r in df.iterrows():
+        due = r["due_current"]
+        if r["status"] == "Cancelled" or not is_date(due):
+            continue
+        if r["status"] == "Done" and is_date(r["completed_on"]):
+            n = (r["completed_on"] - due).days
+            kind = "done_late" if n > 0 else "done"
+            text_ = f"{plural(n, 'day')} late" if n > 0 else ("on the day" if n == 0 else f"{plural(-n, 'day')} early")
+        else:
+            n = (today - due).days
+            kind = "late" if n > 0 else "open"
+            text_ = f"{plural(n, 'day')} past due" if n > 0 else ("due today" if n == 0 else f"due in {plural(-n, 'day')}")
+        rows.append({"title": r["deliverable"], "n": n, "kind": kind, "text": text_, "status": r["status"]})
+    return sorted(rows, key=lambda x: -x["n"])
+
+
+def render_person_detail(name: str, ini: str, m: dict, df: pd.DataFrame, today: dt.date) -> str:
+    kind, reasons = verdict(m)
+    colors = {k: c for k, _, c in SEGMENTS}
+    h = ['<div class="dm"><div class="panel">']
+    h.append(f'<div style="display:flex;gap:12px;align-items:center"><div class="av" style="width:40px;height:40px;font-size:14px">{esc(ini)}</div><div><p class="pname" style="font-size:16px">{esc(name)}</p>{chip(kind)}</div></div>')
+    h.append('<ul class="why">' + "".join(f"<li>{esc(x)}</li>" for x in reasons) + '</ul>')
+
+    h.append('<div class="kpis" style="margin-top:14px">')
+    h.append(f'<div class="kpi"><p class="l">Deliverables</p><div style="margin-top:6px">{stacked(m, sum(m["seg"].values()))}</div><p class="d">{m["wip"]} open &middot; {m["completed"]} completed</p></div>')
+    h.append(f'<div class="kpi"><p class="l">On time</p><div style="margin-top:2px">{meter(m["rate"])}</div><p class="d">{m["on_time"]} of {m["completed"]} completed</p></div>')
+    h.append(f'<div class="kpi"><p class="l">Kept their date</p><div style="margin-top:2px">{meter(m["reliability"], 90, 70, "no dates yet")}</div><p class="d">{m["committed"]} committed</p></div>')
+    h.append(f'<div class="kpi"><p class="l">Open tickets</p><p class="v">{m["tickets"]}</p><p class="d">{m["blocked"]} blocked deliverable{"" if m["blocked"] == 1 else "s"}</p></div>')
+    h.append('</div>')
+
+    rows = schedule_rows(df, today)
+    h.append('<div class="top" style="margin:18px 0 0"><span class="h2">Against the due date</span><span class="muted">left = ahead of the date &middot; right = late</span></div>')
+    if not rows:
+        h.append('<p class="sec" style="margin-top:8px">No deliverables with a due date yet.</p>')
+    else:
+        span = max(max(abs(r["n"]) for r in rows), 7)
+        h.append(f'<div class="daxis"><span></span><div><span>{span} days ahead</span><span>due date</span><span>{span} days late</span></div></div>')
+        for r in rows:
+            w = round(50 * abs(r["n"]) / span, 2)
+            h.append(f'<div class="drow"><span class="t" title="{esc(r["title"])} &middot; {esc(r["status"])}">{esc(r["title"])}</span><div class="dtrack"><div class="dzero"></div>')
+            if r["n"] > 0:
+                h.append(f'<div class="dbar" style="left:50%;width:{max(w, 0.8)}%;background:{colors[r["kind"]]};border-radius:0 4px 4px 0"></div>')
+                pos = f'left:{min(50 + w + 1.5, 78)}%' if w < 30 else f'right:{50 + 1.5}%'
+            else:
+                h.append(f'<div class="dbar" style="right:50%;width:{max(w, 0.8)}%;background:{colors[r["kind"]]};border-radius:4px 0 0 4px"></div>')
+                pos = f'left:{50 + 1.5}%'
+            h.append(f'<span class="dlbl" style="{pos}">{esc(r["text"])}</span></div></div>')
+        h.append('<div class="end"></div>')
+        h.append('<div class="legend" style="flex-wrap:wrap">' + "".join(
+            f'<span><span class="sw" style="background:{c}"></span>{label.lower()}</span>' for k, label, c in SEGMENTS if k != "nodate") + '</div>')
+    if m["uncommitted"]:
+        h.append(f'<p class="sec" style="margin-top:8px">{plural(m["uncommitted"], "deliverable")} without a due date {"is" if m["uncommitted"] == 1 else "are"} not on this chart.</p>')
+    h.append('</div></div>')
+    return "".join(h)
+
+
+def load_changes() -> tuple[pd.DataFrame, str | None]:
+    try:
+        ch = query("""
+            select c.change_id, c.deliverable_id, d.deliverable, u.full_name as owner,
+                   c.changed_at, c.field, c.old_value, c.new_value, coalesce(c.reason, '') as reason
+            from deliverable_changes c
+            join deliverables d on d.deliverable_id = c.deliverable_id
+            join users u on u.user_id = d.user_id
+            order by c.changed_at desc
+            limit 500
+        """)
+        return ch, None
+    except Exception as e:  # noqa: BLE001
+        empty = pd.DataFrame(columns=["change_id", "deliverable_id", "deliverable", "owner", "changed_at", "field", "old_value", "new_value", "reason"])
+        return empty, str(e).splitlines()[0]
+
+
+def metrics_tab() -> None:
+    changes, ch_err = load_changes()
+    tk = open_ticket_counts(tickets)
+    team_m = metrics_for(items, sum(tk.values()), today)
+    per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today)) for n, i in zip(team["name"], team["initials"])]
+
+    st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today), unsafe_allow_html=True)
+    st.markdown(CSS + METRIC_CSS + render_workload(workload(items, names, today)), unsafe_allow_html=True)
+    st.markdown(CSS + METRIC_CSS + render_blocked(items, changes, today), unsafe_allow_html=True)
+
+    if not st.session_state.get("is_admin"):
+        st.info("Per-person metrics, the change log and the weekly report are shown after signing in on the Manage tab.")
+        return
+    st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_people_overview(per), unsafe_allow_html=True)
+    who = st.selectbox("Look at one person", [n for n, _, _ in per], key="m_person")
+    for n, ini, m in per:
+        if n == who:
+            st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(n, ini, m, where(items, items["owner"] == n), today), unsafe_allow_html=True)
+    with st.expander("All numbers per person"):
+        st.markdown(CSS + METRIC_CSS + render_person_cards(per), unsafe_allow_html=True)
+    if ch_err:
+        st.warning("The change log table was not found. Run supabase_metrics_upgrade.sql in Supabase.")
+    st.markdown(CSS + METRIC_CSS + render_changes(changes), unsafe_allow_html=True)
+    st.download_button(
+        "Download weekly report (Excel)", weekly_report(items, per, team_m, changes, today),
+        file_name=f"Weekly report {today:%Y-%m-%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="m_report",
+    )
+
+
+# ----------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------
-tab_pulse, tab_tickets, tab_admin, tab_excel = st.tabs(["Team pulse", "Tickets", "Manage", "Excel"])
+tab_pulse, tab_tickets, tab_metrics, tab_admin, tab_excel = st.tabs(["Team pulse", "Tickets", "Metrics", "Manage", "Excel"])
 
 try:
     items, team = load()
@@ -930,6 +1438,10 @@ def excel_tab() -> None:
                 st.success(f"Inserted {plural(len(ok), 'deliverable')}. They are on the Team pulse tab now.")
 
 
+with tab_metrics:
+    metrics_tab()
+
+
 with tab_excel:
     excel_tab()
 
@@ -960,33 +1472,39 @@ with tab_admin:
     ticket_ids = [int(x) for x in tickets["number"].tolist()]
     lookups = {"users": name_to_id, "assignee": {**name_to_id, "Unassigned": None}}
 
-    which = st.radio("Table", ["Deliverables", "Tickets", "Users"], horizontal=True, key="admin_table")
+    which = st.radio("Table", ["Deliverables", "Tickets", "Users", "Change reasons"], horizontal=True, key="admin_table")
 
     if which == "Deliverables":
         df = query("""
-            select d.deliverable_id, u.full_name as owner, d.deliverable, d.discussed_on, d.due_date,
-                   d.ticket_id, d.status, d.completed_on, d.notes
+            select d.deliverable_id, u.full_name as owner, d.deliverable, d.discussed_on,
+                   d.original_due_date, d.due_date, d.ticket_id, d.status, d.blocked_reason,
+                   d.planned_days, d.completed_on, d.notes
             from deliverables d join users u on u.user_id = d.user_id
             order by d.deliverable_id
         """)
-        for c in ["discussed_on", "due_date", "completed_on"]:
+        for c in ["discussed_on", "original_due_date", "due_date", "completed_on"]:
             df[c] = to_dates(df[c])
         df["ticket_id"] = pd.array(df["ticket_id"], dtype="Int64")
+        df["planned_days"] = pd.to_numeric(df["planned_days"], errors="coerce")
         spec = {
             "table": "deliverables", "pk": "deliverable_id",
             "required": ["user_id", "deliverable", "discussed_on"],
             "kinds": {"deliverable_id": "int", "owner": "text", "deliverable": "text", "discussed_on": "date",
-                      "due_date": "date", "ticket_id": "int", "status": "text", "completed_on": "date", "notes": "text"},
+                      "original_due_date": "date", "due_date": "date", "ticket_id": "int", "status": "text",
+                      "blocked_reason": "text", "planned_days": "float", "completed_on": "date", "notes": "text"},
             "to_db": {"owner": ("user_id", "users")},
-            "disabled": ["deliverable_id"],
+            "disabled": ["deliverable_id", "original_due_date"],
             "config": {
                 "deliverable_id": st.column_config.NumberColumn("ID", width="small"),
                 "owner": st.column_config.SelectboxColumn("Owner", options=list(name_to_id), required=True),
                 "deliverable": st.column_config.TextColumn("Deliverable", width="large", required=True),
                 "discussed_on": st.column_config.DateColumn("Discussed", format="DD/MM/YYYY", default=today, required=True),
+                "original_due_date": st.column_config.DateColumn("First due", format="DD/MM/YYYY", help="Set automatically the first time a due date is given"),
                 "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),
                 "ticket_id": st.column_config.SelectboxColumn("Ticket", options=ticket_ids),
                 "status": st.column_config.SelectboxColumn("Status", options=DELIV_STATUSES, default="Planned", required=True),
+                "blocked_reason": st.column_config.TextColumn("Blocked reason", help="Fill when status is Blocked"),
+                "planned_days": st.column_config.NumberColumn("Planned days", min_value=0.5, step=0.5, format="%.1f"),
                 "completed_on": st.column_config.DateColumn("Completed", format="DD/MM/YYYY"),
                 "notes": st.column_config.TextColumn("Notes", width="medium"),
             },
@@ -1019,7 +1537,7 @@ with tab_admin:
         }
         editor(spec, df, lookups, "ed_tickets")
 
-    else:
+    elif which == "Users":
         spec = {
             "table": "users", "pk": "user_id",
             "required": ["full_name", "initials"],
@@ -1034,3 +1552,29 @@ with tab_admin:
         }
         editor(spec, users_all, lookups, "ed_users")
         st.caption("Tip: untick Active instead of deleting a person who still has deliverables or tickets.")
+
+    else:
+        ch, ch_err = load_changes()
+        if ch_err:
+            st.warning("The change log table was not found. Run supabase_metrics_upgrade.sql in Supabase.")
+        elif ch.empty:
+            st.caption("No changes recorded yet.")
+        else:
+            ch = ch[["change_id", "changed_at", "owner", "deliverable", "field", "old_value", "new_value", "reason"]].copy()
+            ch["changed_at"] = pd.to_datetime(ch["changed_at"], errors="coerce", utc=True).dt.strftime("%d %b %H:%M")
+            spec = {
+                "table": "deliverable_changes", "pk": "change_id",
+                "required": ["deliverable_id", "field"],
+                "kinds": {"change_id": "int", "reason": "text"},
+                "disabled": ["change_id", "changed_at", "owner", "deliverable", "field", "old_value", "new_value"],
+                "config": {
+                    "change_id": st.column_config.NumberColumn("ID", width="small"),
+                    "changed_at": st.column_config.TextColumn("When"),
+                    "deliverable": st.column_config.TextColumn("Deliverable", width="large"),
+                    "old_value": st.column_config.TextColumn("From"),
+                    "new_value": st.column_config.TextColumn("To"),
+                    "reason": st.column_config.TextColumn("Reason", width="large", help="Why the date or status changed"),
+                },
+            }
+            editor(spec, ch, lookups, "ed_changes")
+            st.caption("Only the Reason column can be edited. The log itself is written by the database.")

@@ -71,7 +71,13 @@ def plural(n: int, word: str) -> str:
 # Data (read-only queries; results cached for 60 s, cleared after every save)
 # ----------------------------------------------------------------------------
 def conn():
-    return st.connection("supabase", type="sql")
+    # pool_pre_ping drops stale pooled connections (Supabase's pooler closes idle ones);
+    # connect_timeout turns an unreachable database into an error instead of an endless spinner.
+    cfg = secret("connections", "supabase", {}) or {}
+    kwargs = {"pool_pre_ping": True}
+    if not str(cfg.get("url", "")).startswith("sqlite"):
+        kwargs["connect_args"] = {"connect_timeout": 10}
+    return st.connection("supabase", type="sql", **kwargs)
 
 
 def query(sql: str) -> pd.DataFrame:

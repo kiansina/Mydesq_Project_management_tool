@@ -2,7 +2,7 @@
 
 Tab 1 "Team pulse": deliverables + users tables.
 Tab 2 "Tickets":    tickets table (snapshot of the Jira queue).
-Tab 3 "Manage":     password-protected editor for the three tables (Sina only).
+Tab "Manage":       password-protected editor for the three tables (manager only).
 
 Configuration lives in .streamlit/secrets.toml (see secrets.toml.example):
   [connections.supabase] url = "postgresql+psycopg2://..."   Supabase session-pooler URI
@@ -789,10 +789,10 @@ METRIC_HELP = {
     "committed": "Deliverables that have a due date",
     "uncommitted": "Open deliverables without a due date",
     "completed": "Status Done",
-    "on_time": "Done on or before the due date",
-    "delayed": "Done after the due date, plus open ones past their date",
+    "on_time": "Done on or before the first due date",
+    "delayed": "Done after the first due date, plus open ones past it",
     "rate": "On time / completed that had a due date",
-    "avg_delay": "Average days late, over delayed items only",
+    "avg_delay": "Average days late counted from the first due date, over delayed items only",
     "wip": "Open right now (Planned, In progress, Blocked)",
     "cycle": "Average days from discussed to completed",
     "aging": "Days since the oldest open item was discussed",
@@ -813,22 +813,28 @@ def avg(values) -> float | None:
     return round(sum(vals) / len(vals), 1) if vals else None
 
 
+def first_due(original, current):
+    """The date delay is measured from: the first promised date, else the current one."""
+    return original if is_date(original) else (current if is_date(current) else None)
+
+
 def metrics_for(df: pd.DataFrame, open_tickets: int, today: dt.date) -> dict:
-    live = where(df, df["status"] != "Cancelled")
+    live = where(df, df["status"] != "Cancelled").copy()
+    live["base"] = [first_due(o, d) for o, d in zip(live["due_original"], live["due_current"])]
     open_ = where(live, live["status"].isin(OPEN_STATUSES))
     done = where(live, [s == "Done" and is_date(c) for s, c in zip(live["status"], live["completed_on"])])
-    committed = where(live, [is_date(d) for d in live["due_current"]])
-    done_due = where(done, [is_date(d) for d in done["due_current"]])
-    on_time = sum(1 for c, d in zip(done_due["completed_on"], done_due["due_current"]) if c <= d)
-    late_done = [day_diff(d, c) for c, d in zip(done_due["completed_on"], done_due["due_current"]) if c > d]
-    late_open = [day_diff(d, today) for d in open_["due_current"] if is_date(d) and d < today]
+    committed = where(live, [is_date(d) for d in live["base"]])
+    done_due = where(done, [is_date(d) for d in done["base"]])
+    on_time = sum(1 for c, d in zip(done_due["completed_on"], done_due["base"]) if c <= d)
+    late_done = [day_diff(d, c) for c, d in zip(done_due["completed_on"], done_due["base"]) if c > d]
+    late_open = [day_diff(d, today) for d in open_["base"] if is_date(d) and d < today]
     kept = sum(1 for o, d in zip(committed["due_original"], committed["due_current"]) if not is_date(o) or o == d)
-    variance = [day_diff(o, c) for o, c in zip(done["due_original"], done["completed_on"]) if is_date(o)]
+    variance = [day_diff(d, c) for d, c in zip(done_due["base"], done_due["completed_on"])]
     ages = [day_diff(a, today) for a in open_["discussed_on"] if is_date(a)]
     planned = float(pd.to_numeric(open_["planned_days"], errors="coerce").fillna(0).sum()) if len(open_) else 0.0
+    nodate = sum(1 for d in open_["base"] if not is_date(d))
     return {
-        "total": len(live), "committed": len(committed),
-        "uncommitted": sum(1 for d in open_["due_current"] if not is_date(d)),
+        "total": len(live), "committed": len(committed), "uncommitted": nodate,
         "completed": len(done), "on_time": on_time,
         "delayed": len(late_done) + len(late_open), "delayed_open": len(late_open),
         "rate": round(100 * on_time / len(done_due)) if len(done_due) else None,
@@ -844,9 +850,9 @@ def metrics_for(df: pd.DataFrame, open_tickets: int, today: dt.date) -> dict:
         "seg": {
             "done": len(done) - len(late_done),
             "done_late": len(late_done),
-            "open": sum(1 for d in open_["due_current"] if is_date(d) and d >= today),
+            "open": sum(1 for d in open_["base"] if is_date(d) and d >= today),
             "late": len(late_open),
-            "nodate": sum(1 for d in open_["due_current"] if not is_date(d)),
+            "nodate": nodate,
         },
     }
 
@@ -937,31 +943,22 @@ def render_workload(wl: pd.DataFrame) -> str:
     return "".join(h)
 
 
-def blocked_since(items: pd.DataFrame, changes: pd.DataFrame) -> dict[int, dt.date]:
-    out = {}
-    if len(changes):
-        b = where(changes, [(f == "status" and n == "Blocked") for f, n in zip(changes["field"], changes["new_value"])])
-        for did, when in zip(b["deliverable_id"], b["changed_at"]):
-            d = pd.to_datetime(when, errors="coerce", utc=True)
-            if pd.notna(d) and (int(did) not in out or d.date() > out[int(did)]):
-                out[int(did)] = d.date()
-    return out
-
-
-def render_blocked(items: pd.DataFrame, changes: pd.DataFrame, today: dt.date) -> str:
+def render_blocked(items: pd.DataFrame, today: dt.date) -> str:
     blocked = where(items, items["status"] == "Blocked")
-    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Blocked items</span><span class="muted">issue log</span></div>']
+    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Blocked items</span><span class="muted">delay counted from the first due date</span></div>']
     if not len(blocked):
         h.append('<p class="sec" style="margin-top:8px">Nothing is blocked.</p></div></div>')
         return "".join(h)
-    since = blocked_since(items, changes)
-    h.append('<table class="tbl"><colgroup><col style="width:150px"><col><col><col style="width:80px"></colgroup>')
-    h.append('<thead><tr><th>Owner</th><th>Deliverable</th><th>Reason</th><th class="r">Blocked</th></tr></thead><tbody>')
+    h.append('<table class="tbl"><colgroup><col style="width:150px"><col><col><col style="width:96px"><col style="width:84px"></colgroup>')
+    h.append('<thead><tr><th>Owner</th><th>Deliverable</th><th>Reason</th><th>First due</th><th class="r">Delay</th></tr></thead><tbody>')
     for _, r in blocked.iterrows():
-        start = since.get(int(r["id"]))
-        n = day_diff(start, today)
-        reason = str(r.get("blocked_reason") or "").strip() or '<span style="color:var(--t3)">no reason given</span>'
-        h.append(f'<tr><td>{esc(r["owner"])}</td><td>{esc(r["deliverable"])}</td><td>{reason if reason.startswith("<span") else esc(reason)}</td><td class="r num">{f"{n} d" if n is not None else "&mdash;"}</td></tr>')
+        base = first_due(r.get("due_original"), r.get("due_current"))
+        n = day_diff(base, today)
+        delay = "&mdash;" if n is None else (f"{n} d" if n > 0 else "not yet")
+        tint = ' style="background:#fcebeb"' if n is not None and n > 0 else ""
+        reason = str(r.get("blocked_reason") or "").strip()
+        reason = esc(reason) if reason else '<span style="color:var(--t3)">no reason given</span>'
+        h.append(f'<tr><td>{esc(r["owner"])}</td><td>{esc(r["deliverable"])}</td><td>{reason}</td><td class="num">{base.strftime("%d/%m/%Y") if base else "no date"}</td><td class="r num"{tint}>{delay}</td></tr>')
     h.append('</tbody></table></div></div>')
     return "".join(h)
 
@@ -977,25 +974,8 @@ def render_person_cards(per: list[tuple[str, str, dict]]) -> str:
     return "".join(h)
 
 
-def render_changes(changes: pd.DataFrame, limit: int = 30) -> str:
-    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Change log</span><span class="muted">due dates and statuses, newest first</span></div>']
-    if not len(changes):
-        h.append('<p class="sec" style="margin-top:8px">No changes recorded yet. Every change of a due date or status from now on appears here.</p></div></div>')
-        return "".join(h)
-    h.append('<table class="tbl"><colgroup><col style="width:92px"><col style="width:130px"><col><col style="width:72px"><col style="width:170px"><col style="width:120px"></colgroup>')
-    h.append('<thead><tr><th>When</th><th>Owner</th><th>Deliverable</th><th>Field</th><th>Change</th><th>Reason</th></tr></thead><tbody>')
-    for _, r in changes.head(limit).iterrows():
-        when = pd.to_datetime(r["changed_at"], errors="coerce", utc=True)
-        when_s = when.strftime("%d %b %H:%M") if pd.notna(when) else ""
-        old = esc(r["old_value"]) or "none"
-        new = esc(r["new_value"]) or "none"
-        h.append(f'<tr><td class="num">{when_s}</td><td>{esc(r["owner"])}</td><td>{esc(r["deliverable"])}</td><td>{esc(str(r["field"]).replace("_", " "))}</td><td>{old} &rarr; {new}</td><td>{esc(r["reason"])}</td></tr>')
-    h.append('</tbody></table></div></div>')
-    return "".join(h)
-
-
-def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m: dict, changes: pd.DataFrame, today: dt.date) -> bytes:
-    """Excel workbook: Summary, People, Done this week, Delayed, Due next 7 days, Blocked, No date, Changes."""
+def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m: dict, today: dt.date) -> bytes:
+    """Excel workbook: Summary, People, Done this week, Delayed, Due next 7 days, Blocked, No date."""
     week_ago = today - dt.timedelta(days=7)
     cols = ["owner", "deliverable", "ticket", "status", "discussed_on", "due_original", "due_current", "completed_on", "planned_days", "blocked_reason", "notes"]
     nice = {"owner": "Owner", "deliverable": "Deliverable", "ticket": "Ticket", "status": "Status", "discussed_on": "Discussed",
@@ -1004,7 +984,7 @@ def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m:
     open_ = where(items, items["status"].isin(OPEN_STATUSES))
     sheets = {
         "Done this week": where(items, [s == "Done" and is_date(c) and c >= week_ago for s, c in zip(items["status"], items["completed_on"])]),
-        "Delayed": where(open_, [is_date(d) and d < today for d in open_["due_current"]]),
+        "Delayed": where(open_, [is_date(first_due(o, d)) and first_due(o, d) < today for o, d in zip(open_["due_original"], open_["due_current"])]),
         "Due next 7 days": where(open_, [is_date(d) and today <= d <= today + dt.timedelta(days=7) for d in open_["due_current"]]),
         "Blocked": where(open_, open_["status"] == "Blocked"),
         "No date": where(open_, [not is_date(d) for d in open_["due_current"]]),
@@ -1023,12 +1003,6 @@ def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m:
         for name, df in sheets.items():
             out = df[cols].rename(columns=nice).sort_values(["Owner", "Due date"], na_position="last") if len(df) else pd.DataFrame(columns=[nice[c] for c in cols])
             out.to_excel(xw, sheet_name=name, index=False)
-        if len(changes):
-            ch = changes.copy()
-            ch["changed_at"] = pd.to_datetime(ch["changed_at"], errors="coerce", utc=True)
-            ch = ch[ch["changed_at"] >= pd.Timestamp(week_ago, tz="UTC")]
-            ch["changed_at"] = ch["changed_at"].dt.strftime("%Y-%m-%d %H:%M")
-            ch[["changed_at", "owner", "deliverable", "field", "old_value", "new_value", "reason"]].to_excel(xw, sheet_name="Changes", index=False)
         for ws in xw.sheets.values():
             for col in ws.columns:
                 width = max(len(str(c.value)) if c.value is not None else 0 for c in col)
@@ -1089,7 +1063,7 @@ def verdict(m: dict) -> tuple[str, list[str]]:
         return "none", ["No deliverables recorded yet."]
     bad, watch, good = [], [], []
     if m["delayed_open"]:
-        bad.append(f'{plural(m["delayed_open"], "open deliverable")} past the due date.')
+        bad.append(f'{plural(m["delayed_open"], "open deliverable")} past the first due date.')
     if m["rate"] is not None and m["completed"] >= 2 and m["rate"] < 60:
         bad.append(f'Only {m["rate"]}% of completed work was on time.')
     if m["blocked"] >= 2:
@@ -1166,7 +1140,7 @@ def schedule_rows(df: pd.DataFrame, today: dt.date) -> list[dict]:
     """Days against the due date for every dated deliverable: negative = ahead, positive = late."""
     rows = []
     for _, r in df.iterrows():
-        due = r["due_current"]
+        due = first_due(r.get("due_original"), r.get("due_current"))
         if r["status"] == "Cancelled" or not is_date(due):
             continue
         if r["status"] == "Done" and is_date(r["completed_on"]):
@@ -1196,12 +1170,12 @@ def render_person_detail(name: str, ini: str, m: dict, df: pd.DataFrame, today: 
     h.append('</div>')
 
     rows = schedule_rows(df, today)
-    h.append('<div class="top" style="margin:18px 0 0"><span class="h2">Against the due date</span><span class="muted">left = ahead of the date &middot; right = late</span></div>')
+    h.append('<div class="top" style="margin:18px 0 0"><span class="h2">Against the first due date</span><span class="muted">left = ahead of the date &middot; right = late</span></div>')
     if not rows:
         h.append('<p class="sec" style="margin-top:8px">No deliverables with a due date yet.</p>')
     else:
         span = max(max(abs(r["n"]) for r in rows), 7)
-        h.append(f'<div class="daxis"><span></span><div><span>{span} days ahead</span><span>due date</span><span>{span} days late</span></div></div>')
+        h.append(f'<div class="daxis"><span></span><div><span>{span} days ahead</span><span>first due date</span><span>{span} days late</span></div></div>')
         for r in rows:
             w = round(50 * abs(r["n"]) / span, 2)
             h.append(f'<div class="drow"><span class="t" title="{esc(r["title"])} &middot; {esc(r["status"])}">{esc(r["title"])}</span><div class="dtrack"><div class="dzero"></div>')
@@ -1221,35 +1195,17 @@ def render_person_detail(name: str, ini: str, m: dict, df: pd.DataFrame, today: 
     return "".join(h)
 
 
-def load_changes() -> tuple[pd.DataFrame, str | None]:
-    try:
-        ch = query("""
-            select c.change_id, c.deliverable_id, d.deliverable, u.full_name as owner,
-                   c.changed_at, c.field, c.old_value, c.new_value, coalesce(c.reason, '') as reason
-            from deliverable_changes c
-            join deliverables d on d.deliverable_id = c.deliverable_id
-            join users u on u.user_id = d.user_id
-            order by c.changed_at desc
-            limit 500
-        """)
-        return ch, None
-    except Exception as e:  # noqa: BLE001
-        empty = pd.DataFrame(columns=["change_id", "deliverable_id", "deliverable", "owner", "changed_at", "field", "old_value", "new_value", "reason"])
-        return empty, str(e).splitlines()[0]
-
-
 def metrics_tab() -> None:
-    changes, ch_err = load_changes()
     tk = open_ticket_counts(tickets)
     team_m = metrics_for(items, sum(tk.values()), today)
     per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today)) for n, i in zip(team["name"], team["initials"])]
 
     st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today), unsafe_allow_html=True)
     st.markdown(CSS + METRIC_CSS + render_workload(workload(items, names, today)), unsafe_allow_html=True)
-    st.markdown(CSS + METRIC_CSS + render_blocked(items, changes, today), unsafe_allow_html=True)
+    st.markdown(CSS + METRIC_CSS + render_blocked(items, today), unsafe_allow_html=True)
 
     if not st.session_state.get("is_admin"):
-        st.info("Per-person metrics, the change log and the weekly report are shown after signing in on the Manage tab.")
+        st.info("Per-person metrics and the weekly report are shown after signing in as manager on the Manage tab.")
         return
     st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_people_overview(per), unsafe_allow_html=True)
     who = st.selectbox("Look at one person", [n for n, _, _ in per], key="m_person")
@@ -1258,11 +1214,8 @@ def metrics_tab() -> None:
             st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(n, ini, m, where(items, items["owner"] == n), today), unsafe_allow_html=True)
     with st.expander("All numbers per person"):
         st.markdown(CSS + METRIC_CSS + render_person_cards(per), unsafe_allow_html=True)
-    if ch_err:
-        st.warning("The change log table was not found. Run supabase_metrics_upgrade.sql in Supabase.")
-    st.markdown(CSS + METRIC_CSS + render_changes(changes), unsafe_allow_html=True)
     st.download_button(
-        "Download weekly report (Excel)", weekly_report(items, per, team_m, changes, today),
+        "Download weekly report (Excel)", weekly_report(items, per, team_m, today),
         file_name=f"Weekly report {today:%Y-%m-%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="m_report",
     )
@@ -1382,7 +1335,7 @@ def excel_tab() -> None:
 
     st.markdown("**Import**", unsafe_allow_html=True)
     if not st.session_state.get("is_admin"):
-        st.info("Importing writes to the database. Sign in on the Manage tab first.")
+        st.info("Importing writes to the database. Sign in as manager on the Manage tab first.")
         return
     up = st.file_uploader("Upload a workbook in the Daily module layout", type=["xlsx"], key="x_up")
     swap_dm = st.checkbox("Dates were typed as day/month but Excel stored them as month/day: swap them", value=False, key="x_swap")
@@ -1449,7 +1402,7 @@ with tab_excel:
 with tab_admin:
     admin_pw = str(secret("admin", "password", ""))
     if not st.session_state.get("is_admin"):
-        st.markdown("**Manage the data** &middot; for Sina only", unsafe_allow_html=True)
+        st.markdown("**Manage the data** &middot; for the manager only", unsafe_allow_html=True)
         if not admin_pw:
             st.warning("No admin password set. Add [admin] password = \"...\" to secrets.toml.")
         pw = st.text_input("Password", type="password", key="admin_pw")
@@ -1461,7 +1414,7 @@ with tab_admin:
         st.stop()
 
     top1, top2 = st.columns([4, 1])
-    top1.caption("Signed in as Sina. Changes go straight to Supabase and appear on the other tabs after Save.")
+    top1.caption("Signed in as manager. Changes go straight to Supabase and appear on the other tabs after Save.")
     if top2.button("Sign out", key="admin_logout", use_container_width=True):
         st.session_state["is_admin"] = False
         st.rerun()
@@ -1472,7 +1425,7 @@ with tab_admin:
     ticket_ids = [int(x) for x in tickets["number"].tolist()]
     lookups = {"users": name_to_id, "assignee": {**name_to_id, "Unassigned": None}}
 
-    which = st.radio("Table", ["Deliverables", "Tickets", "Users", "Change reasons"], horizontal=True, key="admin_table")
+    which = st.radio("Table", ["Deliverables", "Tickets", "Users"], horizontal=True, key="admin_table")
 
     if which == "Deliverables":
         df = query("""
@@ -1552,29 +1505,3 @@ with tab_admin:
         }
         editor(spec, users_all, lookups, "ed_users")
         st.caption("Tip: untick Active instead of deleting a person who still has deliverables or tickets.")
-
-    else:
-        ch, ch_err = load_changes()
-        if ch_err:
-            st.warning("The change log table was not found. Run supabase_metrics_upgrade.sql in Supabase.")
-        elif ch.empty:
-            st.caption("No changes recorded yet.")
-        else:
-            ch = ch[["change_id", "changed_at", "owner", "deliverable", "field", "old_value", "new_value", "reason"]].copy()
-            ch["changed_at"] = pd.to_datetime(ch["changed_at"], errors="coerce", utc=True).dt.strftime("%d %b %H:%M")
-            spec = {
-                "table": "deliverable_changes", "pk": "change_id",
-                "required": ["deliverable_id", "field"],
-                "kinds": {"change_id": "int", "reason": "text"},
-                "disabled": ["change_id", "changed_at", "owner", "deliverable", "field", "old_value", "new_value"],
-                "config": {
-                    "change_id": st.column_config.NumberColumn("ID", width="small"),
-                    "changed_at": st.column_config.TextColumn("When"),
-                    "deliverable": st.column_config.TextColumn("Deliverable", width="large"),
-                    "old_value": st.column_config.TextColumn("From"),
-                    "new_value": st.column_config.TextColumn("To"),
-                    "reason": st.column_config.TextColumn("Reason", width="large", help="Why the date or status changed"),
-                },
-            }
-            editor(spec, ch, lookups, "ed_changes")
-            st.caption("Only the Reason column can be edited. The log itself is written by the database.")

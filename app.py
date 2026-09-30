@@ -1001,52 +1001,85 @@ def render_team_metrics(team_m: dict, today: dt.date, mode_label: str = "Discuss
     return "".join(h)
 
 
-WEEK_COLS = ["Past date", "This week", "Next week", "In 2 weeks", "In 3 weeks", "Later", "No date"]
+WEEK_COLS = ["Earlier", "2 weeks ago", "Last week", "This week", "Next week", "In 2 weeks", "Later", "No date"]
 LOAD_TINT = {1: "#e6f1fb", 2: "#cde2fb", 3: "#b5d4f4"}
+WORKLOAD_SHOW = {"Open": "open", "Delivered": "done", "All": "all"}
+CHECK = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="#3b6d11" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M5 12l5 5 9-10"/></svg>'
 
 
-def week_bucket(due, today: dt.date) -> str:
-    if not is_date(due):
+def week_bucket(d, today: dt.date) -> str:
+    """Week column for a date, counted in calendar weeks (Monday start) from this week."""
+    if not is_date(d):
         return "No date"
-    if due < today:
-        return "Past date"
     monday = today - dt.timedelta(days=today.weekday())
-    n = (due - monday).days // 7
-    return WEEK_COLS[1 + n] if n <= 3 else "Later"
+    n = (d - monday).days // 7
+    if n <= -3:
+        return "Earlier"
+    if n >= 3:
+        return "Later"
+    return WEEK_COLS[3 + n]
 
 
-def workload(items: pd.DataFrame, names: list[str], today: dt.date) -> pd.DataFrame:
-    open_ = where(items, items["status"].isin(OPEN_STATUSES)).copy()
-    open_["bucket"] = [week_bucket(d, today) for d in open_["due_current"]]
-    open_["planned"] = pd.to_numeric(open_["planned_days"], errors="coerce").fillna(0) if len(open_) else []
+def workload(items: pd.DataFrame, names: list[str], today: dt.date, show: str = "open") -> pd.DataFrame:
+    """Per person and week: open items by due date, delivered items by completion date."""
+    keep = {"open": OPEN_STATUSES, "done": {"Done"}, "all": OPEN_STATUSES | {"Done"}}[show]
+    df = where(items, items["status"].isin(keep)).copy()
+    df["done"] = [s_ == "Done" for s_ in df["status"]]
+    df["when"] = [c if dn and is_date(c) else d for dn, c, d in zip(df["done"], df["completed_on"], df["due_current"])]
+    df["late"] = [not dn and is_date(w) and w < today for dn, w in zip(df["done"], df["when"])]
+    df["bucket"] = [week_bucket(w, today) for w in df["when"]]
+    df["planned"] = pd.to_numeric(df["planned_days"], errors="coerce").fillna(0) if len(df) else []
     rows = []
     for n in names:
-        mine = where(open_, open_["owner"] == n)
+        mine = where(df, df["owner"] == n)
         row = {"owner": n}
         for c in WEEK_COLS:
             b = where(mine, mine["bucket"] == c)
-            row[c] = (len(b), float(b["planned"].sum()) if len(b) else 0.0)
+            op = where(b, ~b["done"])
+            row[c] = {"open": len(op), "late": int(op["late"].sum()) if len(op) else 0, "done": int(b["done"].sum()) if len(b) else 0,
+                      "days": float(op["planned"].sum()) if len(op) else 0.0}
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def render_workload(wl: pd.DataFrame, mode_label: str = "All work") -> str:
+def render_workload(wl: pd.DataFrame, mode_label: str = "All work", show_label: str = "Open") -> str:
+    what = {"Open": "open work by week of due date", "Delivered": "delivered work by week of completion",
+            "All": "open by due date, delivered by completion"}[show_label]
     h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Workload</span><span class="muted">'
-         f'{esc(mode_label.lower())} &middot; open deliverables by week of due date &middot; d = planned days</span></div>']
-    h.append('<table class="tbl"><colgroup><col>' + '<col style="width:76px">' * len(WEEK_COLS) + '</colgroup>')
-    h.append('<thead><tr><th>Person</th>' + "".join(f'<th class="c">{c}</th>' for c in WEEK_COLS) + '</tr></thead><tbody>')
+         f'{esc(mode_label.lower())} &middot; {what}</span></div>']
+    h.append('<table class="tbl"><colgroup><col>' + '<col style="width:72px">' * len(WEEK_COLS) + '</colgroup>')
+    h.append('<thead><tr><th>Person</th>' + "".join(
+        f'<th class="c"{" style=&quot;font-weight:500;color:var(--t1)&quot;" if c == "This week" else ""}>{c}</th>'.replace("&quot;", '"')
+        for c in WEEK_COLS) + '</tr></thead><tbody>')
     for _, r in wl.iterrows():
         h.append(f'<tr><td>{esc(r["owner"])}</td>')
         for c in WEEK_COLS:
-            n, d = r[c]
-            if not n:
+            v = r[c]
+            if not v["open"] and not v["done"]:
                 h.append('<td class="c" style="color:var(--t3)">&middot;</td>')
                 continue
-            tint = "#fcebeb" if c == "Past date" else ("#faece7" if c == "No date" else LOAD_TINT.get(n, "#86b6ef"))
-            extra = f' <small>{d:g}d</small>' if d else ""
-            h.append(f'<td class="c" style="background:{tint}">{n}{extra}</td>')
+            parts = []
+            if v["open"]:
+                parts.append(f'{v["open"]}' + (f' <small>{v["days"]:g}d</small>' if v["days"] else ""))
+            if v["done"]:
+                parts.append(f'<span style="color:#27500a">{v["done"]}</span>{CHECK}')
+            if v["late"]:
+                tint = "#fcebeb"
+            elif c == "No date" and v["open"]:
+                tint = "#faece7"
+            elif v["open"]:
+                tint = LOAD_TINT.get(v["open"], "#86b6ef")
+            else:
+                tint = "#eaf3de"
+            h.append(f'<td class="c" style="background:{tint}">{" &nbsp;".join(parts)}</td>')
         h.append('</tr>')
-    h.append('</tbody></table></div></div>')
+    h.append('</tbody></table>')
+    h.append('<div class="legend" style="flex-wrap:wrap"><span><span class="sw" style="background:#b5d4f4"></span>open, darker = more</span>'
+             '<span><span class="sw" style="background:#fcebeb"></span>open and past due</span>'
+             '<span><span class="sw" style="background:#eaf3de"></span>delivered</span>'
+             '<span><span class="sw" style="background:#faece7"></span>open, no date</span>'
+             '<span>d = planned days</span></div>')
+    h.append('</div></div>')
     return "".join(h)
 
 
@@ -1318,7 +1351,9 @@ def metrics_tab() -> None:
 
     st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today, mode_label), unsafe_allow_html=True)
     items_m = by_mode(items, mode)
-    st.markdown(CSS + METRIC_CSS + render_workload(workload(items_m, names, today), mode_label), unsafe_allow_html=True)
+    show_label = st.radio("Workload shows", list(WORKLOAD_SHOW), horizontal=True, key="m_wl",
+                          help="Open = still to do, by due date. Delivered = done, by completion date. All = both.")
+    st.markdown(CSS + METRIC_CSS + render_workload(workload(items_m, names, today, WORKLOAD_SHOW[show_label]), mode_label, show_label), unsafe_allow_html=True)
     st.markdown(CSS + METRIC_CSS + render_blocked(items_m, today), unsafe_allow_html=True)
 
     if not st.session_state.get("is_admin"):

@@ -96,6 +96,7 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
                coalesce(d.original_due_date, d.due_date) as due_original,
                d.due_date       as due_current,
                coalesce(d.blocked_reason, '') as blocked_reason,
+               coalesce(d.is_extra, false) as is_extra,
                d.planned_days,
                d.status,
                d.completed_on,
@@ -115,6 +116,7 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
     items["status"] = items["status"].astype(str).str.strip().replace("", "Planned")
     items["owner"] = items["owner"].astype(str).str.strip()
     items["deliverable"] = items["deliverable"].astype(str).str.strip()
+    items["is_extra"] = [bool(x) for x in items["is_extra"]]
     team["name"] = team["name"].astype(str).str.strip()
     team["initials"] = [str(i).strip() or n[:2] for i, n in zip(team["initials"], team["name"])]
     return items, team
@@ -251,6 +253,18 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 .dm .lbl{position:absolute;top:1px;font-size:11px;color:var(--t2);white-space:nowrap}
 .dm .bar.open{background:var(--acc)}.dm .bar.done{background:#639922}.dm .bar.late{background:#e24b4a}
 .dm .lbl svg{width:13px;height:13px;vertical-align:-2px}
+.dm .pc{background:var(--s2);border:0.5px solid var(--b);border-radius:12px;overflow:hidden;margin-top:14px}
+.dm .pch{display:flex;align-items:center;gap:12px;padding:10px 14px}
+.dm .pav{width:34px;height:34px;border-radius:50%;color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:500;flex:none}
+.dm .pnm{font-size:16px;font-weight:500;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dm .pchips{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.dm .pk{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 9px;border-radius:10px;background:rgba(255,255,255,.8);color:var(--t1);white-space:nowrap}
+.dm .pk i{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dm .pbody{padding:2px 14px 8px}
+.dm .pbody .hdr2{margin:8px 0 2px}
+.dm .pbody .row2 .t{font-size:13.5px}
+.dm .pbody details.dl:first-of-type summary{border-top:0}
+.dm .xtag{display:inline-block;font-size:11px;line-height:1.5;padding:0 6px;border-radius:6px;background:#eeedfe;color:#3c3489;margin-left:4px;vertical-align:1px}
 .dm .pill.nodate{background:#faece7;color:#712b13}.dm .pill svg{width:13px;height:13px;vertical-align:-2px}
 .dm .av{width:24px;height:24px;border-radius:50%;background:var(--accbg);color:var(--acct);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;flex:none}
 .dm .track{position:relative;height:18px}
@@ -293,6 +307,41 @@ ICON = {
 }
 
 
+# One color family per person: (header tint, avatar fill, name ink). Assigned in team order.
+PERSON_COLORS = [
+    ("#e6f1fb", "#378add", "#0c447c"),   # blue
+    ("#e1f5ee", "#1d9e75", "#085041"),   # teal
+    ("#faece7", "#d85a30", "#712b13"),   # coral
+    ("#eeedfe", "#7f77dd", "#3c3489"),   # purple
+    ("#fbeaf0", "#d4537e", "#72243e"),   # pink
+    ("#faeeda", "#ba7517", "#633806"),   # amber
+    ("#eaf3de", "#639922", "#27500a"),   # green
+    ("#f1efe8", "#888780", "#444441"),   # gray
+]
+
+
+def person_color(i: int) -> tuple[str, str, str]:
+    return PERSON_COLORS[i % len(PERSON_COLORS)]
+
+
+def person_header(name: str, ini: str, mine: pd.DataFrame, color: tuple[str, str, str]) -> str:
+    tint, fill, ink = color
+    kinds = list(mine["kind"])
+    dated = list(mine["has_date"])
+    counts = [
+        (sum(1 for k, d in zip(kinds, dated) if k == "open" and d), "open", "#2a78d6"),
+        (sum(1 for k in kinds if k == "late"), "late", "#e24b4a"),
+        (sum(1 for k, d in zip(kinds, dated) if k == "open" and not d), "no date", "#eb6834"),
+        (sum(1 for k in kinds if k == "done"), "done", "#639922"),
+        (sum(1 for x in mine.get("is_extra", []) if bool(x)), "extra", "#7f77dd"),
+    ]
+    chips = "".join(f'<span class="pk"><i style="background:{c}"></i>{n} {label}</span>' for n, label, c in counts if n)
+    return (f'<div class="pc"><div class="pch" style="background:{tint}">'
+            f'<div class="pav" style="background:{fill}">{esc(ini)}</div>'
+            f'<div class="pnm" style="color:{ink}" title="{esc(name)}">{esc(name)}</div>'
+            f'<div class="pchips">{chips}</div></div>')
+
+
 def detail_body(r, today: dt.date) -> str:
     """Expanded details for one deliverable row of the timeline."""
     due = r["due_current"]
@@ -313,6 +362,7 @@ def detail_body(r, today: dt.date) -> str:
     pairs = [
         ("Deliverable", esc(r["deliverable"])),
         ("Owner", esc(r["owner"])),
+        ("Type", "Extra task, added after the stand-up" if bool(r.get("is_extra", False)) else "Planned at the stand-up"),
         ("Discussed on", esc(disc.strftime("%A %d %B %Y")) if is_date(disc) else "&mdash;"),
         ("Due", due_txt),
         ("Status", esc(r["status"])),
@@ -351,7 +401,8 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
     tl = m["timeline"]
     dated = where(tl, tl["has_date"])
     starts = [d for d in tl["discussed_on"] if is_date(d)]
-    lo = min(starts + [today]) - dt.timedelta(days=3)
+    # Show at most three weeks of history, so one old item cannot squash everyone's bars.
+    lo = max(min(starts + [today]) - dt.timedelta(days=3), today - dt.timedelta(days=21))
     ends = list(dated["due_current"]) + [c for c in tl["completed_on"] if is_date(c)]
     hi = max(ends + [today]) + dt.timedelta(days=3)
     if (hi - lo).days < 14:
@@ -359,29 +410,36 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
     span = (hi - lo).days
 
     def pct(d: dt.date) -> float:
-        return round(100 * (d - lo).days / span, 2)
+        return round(max(0.0, min(100.0, 100 * (d - lo).days / span)), 2)
 
     h.append('<div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Own timelines</span><span class="muted">discussed &rarr; committed due date &middot; sorted by due date</span></div>')
     ticks = sorted({today} | set(dated["due_current"]))
-    h.append('<div class="hdr2"><span></span><div class="axis">')
+    ax = ['<div class="hdr2"><span></span><div class="axis">']
     last = -100.0
     for t in ticks:
+        if t < lo:
+            continue
         p = pct(t)
         if p - last < 9:
             continue
         last = p
-        h.append(f'<span style="left:{p}%">{esc(t.strftime("%d %b").lstrip("0"))}</span>')
-    h.append('</div></div>')
+        ax.append(f'<span style="left:{p}%">{esc(t.strftime("%d %b").lstrip("0"))}</span>')
+    ax.append('</div></div>')
+    axis_html = "".join(ax)
+    pal = {p["name"]: person_color(i) for i, p in enumerate(m["people"])}
 
     if not len(tl):
         h.append('<p class="sec" style="margin-top:12px">Nothing open. Add the next deliverables at stand-up.</p>')
     cur = None
     for _, r in tl.iterrows():
         if r["owner"] != cur:
+            if cur is not None:
+                h.append('</div></div>')
             cur = r["owner"]
             mine = where(tl, tl["owner"] == cur)
-            n_done = int((mine["kind"] == "done").sum())
-            h.append(f'<p class="grp">{esc(cur)} &middot; {len(mine) - n_done} open' + (f' &middot; {n_done} done' if n_done else '') + '</p>')
+            ini = initials.get(cur, cur[:2].upper())
+            h.append(person_header(cur, ini, mine, pal.get(cur, PERSON_COLORS[-1])))
+            h.append('<div class="pbody">' + axis_html)
         title = esc(r["deliverable"])
         extra = []
         if pd.notna(r.get("priority")) and str(r.get("priority")).strip() not in ("", "nan"):
@@ -390,6 +448,8 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
             extra.append(esc(r["ticket"]))
         if extra:
             title += ' <span class="muted">&middot; ' + " &middot; ".join(extra) + '</span>'
+        if bool(r.get("is_extra", False)):
+            title += ' <span class="xtag">extra</span>'
         h.append(f'<details class="dl"><summary class="row2"><span class="t" title="{esc(r["deliverable"])}">{title}</span><div class="track">')
         h.append(f'<div class="today" style="left:{pct(today)}%"></div>')
         kind = r.get("kind", "open")
@@ -407,18 +467,21 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
             else:
                 h.append(f'<span class="lbl" style="right:{100 - left + 1.5}%">{lbl}</span>')
         else:
-            h.append(f'<span class="pill nodate" style="position:absolute;left:{pct(today) + 1}%;top:-2px">{ICON["nodate"]} Needs a date</span>')
+            pos = f'left:{pct(today) + 1}%' if pct(today) < 72 else f'right:{100 - pct(today) + 1}%'
+            h.append(f'<span class="pill nodate" style="position:absolute;{pos};top:-2px">{ICON["nodate"]} Needs a date</span>')
         h.append('</div></summary>')
         h.append(detail_body(r, today))
         h.append('</details>')
-    h.append('<div class="end"></div>')
+    if cur is not None:
+        h.append('</div></div>')
     h.append('<div class="legend"><span><span class="sw" style="background:#2a78d6"></span>in progress</span>'
              '<span><span class="sw" style="background:#639922"></span>done</span>'
              '<span><span class="sw" style="background:#e24b4a"></span>past due date</span></div></div>')
 
     # People
     h.append('<div class="block"><span class="h2">People</span><div class="cards">')
-    for p in m["people"]:
+    for i, p in enumerate(m["people"]):
+        _, fill, _ = person_color(i)
         if p["open"]:
             s = f'{p["open"]} open'
             s += f' &middot; next due {fmt(p["next_due"])}' if is_date(p["next_due"]) else " &middot; dates pending"
@@ -431,7 +494,7 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
             k, kc = "On time &mdash; &middot; streak 0", "k"
         else:
             k, kc = "Add first deliverable", "k link"
-        h.append(f'<div class="card"><div class="who"><div class="av">{esc(p["initials"])}</div><div><p class="n">{esc(p["name"])}</p><p class="s">{s}</p></div></div><p class="{kc}">{k}</p></div>')
+        h.append(f'<div class="card"><div class="who"><div class="av" style="background:{fill};color:#fff">{esc(p["initials"])}</div><div><p class="n">{esc(p["name"])}</p><p class="s">{s}</p></div></div><p class="{kc}">{k}</p></div>')
     h.append('</div></div>')
 
     # Wins
@@ -648,7 +711,7 @@ def sheet_name(full_name: str) -> str:
 
 
 def export_workbook(items: pd.DataFrame, team: pd.DataFrame) -> bytes:
-    """One sheet per active person: id, #deliverable, discussion_date, due date, Comment, ticket, status."""
+    """One sheet per active person: id, #deliverable, discussion_date, due date, Comment, ticket, status, extra."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         for name in team["name"]:
@@ -661,10 +724,11 @@ def export_workbook(items: pd.DataFrame, team: pd.DataFrame) -> bytes:
                 "Comment": mine["notes"].tolist(),
                 "ticket": mine["ticket"].tolist(),
                 "status": mine["status"].tolist(),
+                "extra": ["yes" if x else "" for x in extra_flags(mine)],
             })
             df.to_excel(xw, sheet_name=sheet_name(name), index=False)
             ws = xw.sheets[sheet_name(name)]
-            for col, w in zip("ABCDEFG", [5, 60, 16, 16, 40, 14, 12]):
+            for col, w in zip("ABCDEFGH", [5, 60, 16, 16, 40, 14, 12, 8]):
                 ws.column_dimensions[col].width = w
             ws.freeze_panes = "A2"
     return buf.getvalue()
@@ -715,6 +779,7 @@ def parse_upload(data: bytes, names: list[str], ticket_summaries: dict[int, str]
         cols = list(df.columns)
         c_del, c_disc, c_due = find_col(cols, "deliv"), find_col(cols, "discuss"), find_col(cols, "due")
         c_com, c_tic, c_stat = find_col(cols, "comment", "note"), find_col(cols, "ticket"), find_col(cols, "status")
+        c_ext = find_col(cols, "extra")
         for i, r in df.iterrows():
             raw = str(r[c_del]).replace("\xa0", " ").strip() if c_del else ""
             if not raw and not (c_tic and str(r[c_tic]).strip()):
@@ -759,6 +824,7 @@ def parse_upload(data: bytes, names: list[str], ticket_summaries: dict[int, str]
             out.append({
                 "sheet": sheet, "row": int(i) + 2, "owner": owner, "deliverable": text, "discussed_on": disc,
                 "due_date": due, "ticket_id": ticket, "status": status, "notes": "; ".join(notes) or None,
+                "is_extra": bool(c_ext) and str(r[c_ext]).strip().lower() in ("yes", "y", "true", "1", "x", "extra"),
                 "problem": "; ".join(problems),
             })
     return pd.DataFrame(out)
@@ -783,6 +849,7 @@ METRIC_LABELS = [
     ("on_time", "On time"), ("delayed", "Delayed"), ("rate", "On-time rate"), ("avg_delay", "Average delay"),
     ("wip", "In progress"), ("cycle", "Cycle time"), ("aging", "Oldest open"), ("tickets", "Open tickets"),
     ("reliability", "Kept their date"), ("variance", "Schedule variance"), ("blocked", "Blocked"), ("planned", "Planned days open"),
+    ("extras", "Extra tasks"),
 ]
 METRIC_HELP = {
     "total": "All deliverables except cancelled ones",
@@ -801,6 +868,7 @@ METRIC_HELP = {
     "variance": "Average of completed date minus the first promised date; negative = early",
     "blocked": "Open deliverables with status Blocked",
     "planned": "Sum of planned days over open deliverables",
+    "extras": "Tasks added after the stand-up, counted whatever the Measure switch says",
 }
 
 
@@ -818,7 +886,7 @@ def first_due(original, current):
     return original if is_date(original) else (current if is_date(current) else None)
 
 
-def metrics_for(df: pd.DataFrame, open_tickets: int, today: dt.date) -> dict:
+def _metrics_core(df: pd.DataFrame, open_tickets: int, today: dt.date) -> dict:
     live = where(df, df["status"] != "Cancelled").copy()
     live["base"] = [first_due(o, d) for o, d in zip(live["due_original"], live["due_current"])]
     open_ = where(live, live["status"].isin(OPEN_STATUSES))
@@ -857,6 +925,42 @@ def metrics_for(df: pd.DataFrame, open_tickets: int, today: dt.date) -> dict:
     }
 
 
+MODES = {"Discussed only": "planned", "All work": "all", "Extras only": "extras"}
+
+
+def extra_flags(df: pd.DataFrame) -> list[bool]:
+    return [bool(x) for x in df["is_extra"]] if "is_extra" in df.columns else [False] * len(df)
+
+
+def by_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    flags = extra_flags(df)
+    if mode == "planned":
+        return where(df, [not f for f in flags])
+    if mode == "extras":
+        return where(df, flags)
+    return df
+
+
+def metrics_for(df: pd.DataFrame, open_tickets: int, today: dt.date, mode: str = "planned") -> dict:
+    """Performance numbers on the chosen slice of work, plus extras counted separately."""
+    m = _metrics_core(by_mode(df, mode), open_tickets, today)
+    extras = where(df, [f and s != "Cancelled" for f, s in zip(extra_flags(df), df["status"])])
+    m["extras"] = len(extras)
+    m["extras_done"] = sum(1 for x in extras["status"] if x == "Done")
+    m["extras_open"] = sum(1 for x in extras["status"] if x in OPEN_STATUSES)
+    return m
+
+
+def extras_cell(m: dict, scale: int) -> str:
+    n = m.get("extras", 0)
+    if not n:
+        return '<span class="mnone">none</span>'
+    w = round(100 * n / max(scale, 1), 1)
+    return (f'<div class="stackrow" title="{m["extras_done"]} done, {m["extras_open"]} open">'
+            f'<div class="stack" style="width:{w}%"><span style="flex:1 1 0;background:#7f77dd;border-radius:0 4px 4px 0"></span></div>'
+            f'<span class="cnt">{n}</span></div>')
+
+
 def show_metric(key: str, m: dict) -> str:
     v = m.get(key)
     if v is None:
@@ -877,9 +981,9 @@ def open_ticket_counts(tickets: pd.DataFrame) -> dict[str, int]:
     return {str(k): int(v) for k, v in op["assignee"].value_counts().items()}
 
 
-def render_team_metrics(team_m: dict, today: dt.date) -> str:
+def render_team_metrics(team_m: dict, today: dt.date, mode_label: str = "Discussed only") -> str:
     h = ['<div class="dm">']
-    h.append(f'<div class="top"><span class="h1">Team metrics</span><span class="muted">{today.strftime("%a %d %b %Y")}</span></div>')
+    h.append(f'<div class="top"><span class="h1">Team metrics</span><span class="muted">{esc(mode_label.lower())} &middot; {today.strftime("%a %d %b %Y")}</span></div>')
     h.append('<div class="kpis">')
     tiles = [
         ("Total deliverables", "total", f'{team_m["committed"]} committed &middot; {team_m["uncommitted"]} without a date'),
@@ -888,6 +992,7 @@ def render_team_metrics(team_m: dict, today: dt.date) -> str:
         ("Delayed", "delayed", f'{team_m["delayed_open"]} still open'),
         ("Kept their date", "reliability", "due date never moved"),
         ("Cycle time", "cycle", "discussed to completed"),
+        ("Extra tasks", "extras", f'{team_m["extras_done"]} done &middot; {team_m["extras_open"]} open'),
     ]
     for label, key, sub in tiles:
         h.append(f'<div class="kpi"><p class="l">{label}</p><p class="v">{show_metric(key, team_m)}</p><p class="d">{sub}</p></div>')
@@ -974,11 +1079,12 @@ def render_person_cards(per: list[tuple[str, str, dict]]) -> str:
     return "".join(h)
 
 
-def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m: dict, today: dt.date) -> bytes:
-    """Excel workbook: Summary, People, Done this week, Delayed, Due next 7 days, Blocked, No date."""
+def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m: dict, today: dt.date, mode_label: str = "Discussed only") -> bytes:
+    """Excel workbook: Summary, People, Done this week, Delayed, Due next 7 days, Blocked, No date, Extra tasks."""
     week_ago = today - dt.timedelta(days=7)
-    cols = ["owner", "deliverable", "ticket", "status", "discussed_on", "due_original", "due_current", "completed_on", "planned_days", "blocked_reason", "notes"]
-    nice = {"owner": "Owner", "deliverable": "Deliverable", "ticket": "Ticket", "status": "Status", "discussed_on": "Discussed",
+    items = items.assign(is_extra=["yes" if x else "" for x in extra_flags(items)])
+    cols = ["owner", "deliverable", "is_extra", "ticket", "status", "discussed_on", "due_original", "due_current", "completed_on", "planned_days", "blocked_reason", "notes"]
+    nice = {"owner": "Owner", "deliverable": "Deliverable", "is_extra": "Extra", "ticket": "Ticket", "status": "Status", "discussed_on": "Discussed",
             "due_original": "First due date", "due_current": "Due date", "completed_on": "Completed", "planned_days": "Planned days",
             "blocked_reason": "Blocked reason", "notes": "Notes"}
     open_ = where(items, items["status"].isin(OPEN_STATUSES))
@@ -988,9 +1094,11 @@ def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m:
         "Due next 7 days": where(open_, [is_date(d) and today <= d <= today + dt.timedelta(days=7) for d in open_["due_current"]]),
         "Blocked": where(open_, open_["status"] == "Blocked"),
         "No date": where(open_, [not is_date(d) for d in open_["due_current"]]),
+        "Extra tasks": where(items, [x == "yes" and s != "Cancelled" for x, s in zip(items["is_extra"], items["status"])]),
     }
     summary = pd.DataFrame(
-        [("Report date", today.isoformat()), ("Period", f"{week_ago.isoformat()} to {today.isoformat()}")]
+        [("Report date", today.isoformat()), ("Period", f"{week_ago.isoformat()} to {today.isoformat()}"),
+         ("Performance numbers cover", mode_label)]
         + [(label, show_metric(key, team_m).replace("&mdash;", "-")) for key, label in METRIC_LABELS if key != "tickets"]
         + [(name, len(df)) for name, df in sheets.items()],
         columns=["Item", "Value"],
@@ -1013,7 +1121,7 @@ def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m:
 
 PEOPLE_CSS = """
 <style>
-.dm .phead,.dm .prow{display:grid;grid-template-columns:190px minmax(0,1fr) 118px 118px;gap:16px;align-items:center}
+.dm .phead,.dm .prow{display:grid;grid-template-columns:190px minmax(0,1fr) 110px 110px 96px;gap:16px;align-items:center}
 .dm .phead{font-size:12px;color:var(--t2);padding:8px 0 6px}
 .dm .prow{padding:11px 0;border-top:0.5px solid var(--b)}
 .dm .pname{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1122,17 +1230,19 @@ def legend_segments() -> str:
 
 def render_people_overview(per: list[tuple[str, str, dict]]) -> str:
     scale = max([sum(m["seg"].values()) for _, _, m in per] + [1])
+    xscale = max([m.get("extras", 0) for _, _, m in per] + [1])
     h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">People at a glance</span><span class="muted">bar length = number of deliverables</span></div>']
-    h.append('<div class="phead"><span>Person</span><span>Deliverables by state</span><span title="Completed on or before the due date">On time</span><span title="Due date never moved after the first promise">Kept their date</span></div>')
-    for name, ini, m in per:
+    h.append('<div class="phead"><span>Person</span><span>Deliverables by state</span><span title="Completed on or before the due date">On time</span><span title="Due date never moved after the first promise">Kept their date</span><span title="Tasks added after the stand-up">Extras</span></div>')
+    for idx, (name, ini, m) in enumerate(per):
         kind, _ = verdict(m)
         h.append('<div class="prow">')
-        h.append(f'<div style="display:flex;gap:10px;align-items:center"><div class="av" style="width:34px;height:34px;font-size:12px">{esc(ini)}</div><div style="min-width:0"><p class="pname" title="{esc(name)}">{esc(name)}</p>{chip(kind)}</div></div>')
+        h.append(f'<div style="display:flex;gap:10px;align-items:center"><div class="av" style="width:34px;height:34px;font-size:12px;background:{person_color(idx)[1]};color:#fff">{esc(ini)}</div><div style="min-width:0"><p class="pname" title="{esc(name)}">{esc(name)}</p>{chip(kind)}</div></div>')
         h.append(f'<div>{stacked(m, scale)}</div>')
         h.append(f'<div>{meter(m["rate"])}</div>')
         h.append(f'<div>{meter(m["reliability"], 90, 70, "no dates yet")}</div>')
+        h.append(f'<div>{extras_cell(m, xscale)}</div>')
         h.append('</div>')
-    h.append('<div class="end"></div>' + legend_segments() + '</div></div>')
+    h.append('<div class="end"></div>' + legend_segments().replace('</div>', '<span><span class="sw" style="background:#7f77dd"></span>extra tasks</span></div>') + '</div></div>')
     return "".join(h)
 
 
@@ -1167,6 +1277,7 @@ def render_person_detail(name: str, ini: str, m: dict, df: pd.DataFrame, today: 
     h.append(f'<div class="kpi"><p class="l">On time</p><div style="margin-top:2px">{meter(m["rate"])}</div><p class="d">{m["on_time"]} of {m["completed"]} completed</p></div>')
     h.append(f'<div class="kpi"><p class="l">Kept their date</p><div style="margin-top:2px">{meter(m["reliability"], 90, 70, "no dates yet")}</div><p class="d">{m["committed"]} committed</p></div>')
     h.append(f'<div class="kpi"><p class="l">Open tickets</p><p class="v">{m["tickets"]}</p><p class="d">{m["blocked"]} blocked deliverable{"" if m["blocked"] == 1 else "s"}</p></div>')
+    h.append(f'<div class="kpi"><p class="l">Extra tasks</p><p class="v">{m["extras"]}</p><p class="d">{m["extras_done"]} done &middot; {m["extras_open"]} open</p></div>')
     h.append('</div>')
 
     rows = schedule_rows(df, today)
@@ -1196,11 +1307,14 @@ def render_person_detail(name: str, ini: str, m: dict, df: pd.DataFrame, today: 
 
 
 def metrics_tab() -> None:
+    mode_label = st.radio("Measure", list(MODES), horizontal=True, key="m_mode",
+                          help="Extras are tasks added after the stand-up. Discussed only shows real progress on what was committed at the stand-up.")
+    mode = MODES[mode_label]
     tk = open_ticket_counts(tickets)
-    team_m = metrics_for(items, sum(tk.values()), today)
-    per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today)) for n, i in zip(team["name"], team["initials"])]
+    team_m = metrics_for(items, sum(tk.values()), today, mode)
+    per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today, mode)) for n, i in zip(team["name"], team["initials"])]
 
-    st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today), unsafe_allow_html=True)
+    st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today, mode_label), unsafe_allow_html=True)
     st.markdown(CSS + METRIC_CSS + render_workload(workload(items, names, today)), unsafe_allow_html=True)
     st.markdown(CSS + METRIC_CSS + render_blocked(items, today), unsafe_allow_html=True)
 
@@ -1211,11 +1325,11 @@ def metrics_tab() -> None:
     who = st.selectbox("Look at one person", [n for n, _, _ in per], key="m_person")
     for n, ini, m in per:
         if n == who:
-            st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(n, ini, m, where(items, items["owner"] == n), today), unsafe_allow_html=True)
+            st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(n, ini, m, by_mode(where(items, items["owner"] == n), mode), today), unsafe_allow_html=True)
     with st.expander("All numbers per person"):
         st.markdown(CSS + METRIC_CSS + render_person_cards(per), unsafe_allow_html=True)
     st.download_button(
-        "Download weekly report (Excel)", weekly_report(items, per, team_m, today),
+        "Download weekly report (Excel)", weekly_report(items, per, team_m, today, mode_label),
         file_name=f"Weekly report {today:%Y-%m-%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="m_report",
     )
@@ -1240,10 +1354,12 @@ loaded_at = dt.datetime.now().strftime("%H:%M")
 
 with tab_pulse:
     # Filter row: people and a due-date range. Empty = everyone / all dates.
-    f1, f2, f3 = st.columns([2, 1, 1])
+    f1, f2, f3, f4 = st.columns([2, 1, 1, 1.1])
     sel = f1.multiselect("People", names, default=[], placeholder="Everyone", key="p_people")
     due_from = f2.date_input("Due from", value=None, format="DD/MM/YYYY", key="p_from")
     due_to = f3.date_input("Due to", value=None, format="DD/MM/YYYY", key="p_to")
+    work = MODES[f4.selectbox("Work", ["All work", "Discussed only", "Extras only"], key="p_work",
+                              help="Discussed only = what was committed at the stand-up. Extras = tasks added afterwards.")]
 
     chosen = sel or names
     team_f = where(team, [n in chosen for n in names])
@@ -1254,7 +1370,7 @@ with tab_pulse:
             ok and (not is_date(d) or ((not due_from or d >= due_from) and (not due_to or d <= due_to)))
             for ok, d in zip(mask, items["due_current"])
         ]
-    items_f = where(items, mask)
+    items_f = by_mode(where(items, mask), work)
     scope = "all closed"
     if due_from or due_to:
         scope = f"due {fmt(due_from) if due_from else 'any'} to {fmt(due_to) if due_to else 'any'}"
@@ -1339,6 +1455,8 @@ def excel_tab() -> None:
         return
     up = st.file_uploader("Upload a workbook in the Daily module layout", type=["xlsx"], key="x_up")
     swap_dm = st.checkbox("Dates were typed as day/month but Excel stored them as month/day: swap them", value=False, key="x_swap")
+    mark_extra = st.checkbox("Mark every row in this file as an extra task", value=False, key="x_extra",
+                             help="Otherwise the file's 'extra' column decides, and rows without it are planned work")
     if up is not None:
         ticket_summaries = {int(n): s for n, s in zip(tickets["number"], tickets["summary"])}
         try:
@@ -1349,6 +1467,8 @@ def excel_tab() -> None:
         if cand.empty:
             st.warning("No rows with a deliverable found.")
             return
+        if mark_extra:
+            cand["is_extra"] = True
         existing = {(o, d.lower(), s) for o, d, s in zip(items["owner"], items["deliverable"], items["discussed_on"])}
         cand["problem"] = [
             p or ("already in the database" if (o, str(d).lower(), s) in existing else "")
@@ -1357,7 +1477,7 @@ def excel_tab() -> None:
         ok = cand[cand["problem"] == ""]
         st.caption(f"{len(cand)} rows read &middot; {len(ok)} ready to insert &middot; {len(cand) - len(ok)} skipped (see Problem)", unsafe_allow_html=True)
         st.dataframe(
-            cand[["sheet", "row", "owner", "deliverable", "discussed_on", "due_date", "ticket_id", "status", "notes", "problem"]],
+            cand[["sheet", "row", "owner", "deliverable", "is_extra", "discussed_on", "due_date", "ticket_id", "status", "notes", "problem"]],
             hide_index=True, use_container_width=True,
             column_config={
                 "discussed_on": st.column_config.DateColumn("Discussed", format="DD/MM/YYYY"),
@@ -1365,6 +1485,7 @@ def excel_tab() -> None:
                 "ticket_id": st.column_config.NumberColumn("Ticket", format="%d"),
                 "deliverable": st.column_config.TextColumn(width="large"),
                 "problem": st.column_config.TextColumn("Problem", width="medium"),
+                "is_extra": st.column_config.CheckboxColumn("Extra"),
             },
         )
         if st.button(f"Insert {len(ok)} row{'s' if len(ok) != 1 else ''}", disabled=ok.empty, type="primary", key="x_ins"):
@@ -1376,12 +1497,12 @@ def excel_tab() -> None:
                 with conn().session as s:
                     for _, r in ok.iterrows():
                         s.execute(text(
-                            "insert into deliverables (user_id, deliverable, discussed_on, due_date, ticket_id, status, notes) "
-                            "values (:user_id, :deliverable, :discussed_on, :due_date, :ticket_id, :status, :notes)"
+                            "insert into deliverables (user_id, deliverable, discussed_on, due_date, ticket_id, status, notes, is_extra) "
+                            "values (:user_id, :deliverable, :discussed_on, :due_date, :ticket_id, :status, :notes, :is_extra)"
                         ), {
                             "user_id": name_to_id[r["owner"]], "deliverable": r["deliverable"], "discussed_on": r["discussed_on"],
                             "due_date": r["due_date"], "ticket_id": None if pd.isna(r["ticket_id"]) else int(r["ticket_id"]),
-                            "status": r["status"], "notes": r["notes"],
+                            "status": r["status"], "notes": r["notes"], "is_extra": bool(r["is_extra"]),
                         })
                     s.commit()
             except SQLAlchemyError as e:
@@ -1429,7 +1550,7 @@ with tab_admin:
 
     if which == "Deliverables":
         df = query("""
-            select d.deliverable_id, u.full_name as owner, d.deliverable, d.discussed_on,
+            select d.deliverable_id, u.full_name as owner, d.deliverable, d.is_extra, d.discussed_on,
                    d.original_due_date, d.due_date, d.ticket_id, d.status, d.blocked_reason,
                    d.planned_days, d.completed_on, d.notes
             from deliverables d join users u on u.user_id = d.user_id
@@ -1439,10 +1560,11 @@ with tab_admin:
             df[c] = to_dates(df[c])
         df["ticket_id"] = pd.array(df["ticket_id"], dtype="Int64")
         df["planned_days"] = pd.to_numeric(df["planned_days"], errors="coerce")
+        df["is_extra"] = [bool(x) for x in df["is_extra"]]
         spec = {
             "table": "deliverables", "pk": "deliverable_id",
             "required": ["user_id", "deliverable", "discussed_on"],
-            "kinds": {"deliverable_id": "int", "owner": "text", "deliverable": "text", "discussed_on": "date",
+            "kinds": {"deliverable_id": "int", "owner": "text", "deliverable": "text", "is_extra": "bool", "discussed_on": "date",
                       "original_due_date": "date", "due_date": "date", "ticket_id": "int", "status": "text",
                       "blocked_reason": "text", "planned_days": "float", "completed_on": "date", "notes": "text"},
             "to_db": {"owner": ("user_id", "users")},
@@ -1451,6 +1573,7 @@ with tab_admin:
                 "deliverable_id": st.column_config.NumberColumn("ID", width="small"),
                 "owner": st.column_config.SelectboxColumn("Owner", options=list(name_to_id), required=True),
                 "deliverable": st.column_config.TextColumn("Deliverable", width="large", required=True),
+                "is_extra": st.column_config.CheckboxColumn("Extra", default=False, help="Tick for tasks added after the stand-up"),
                 "discussed_on": st.column_config.DateColumn("Discussed", format="DD/MM/YYYY", default=today, required=True),
                 "original_due_date": st.column_config.DateColumn("First due", format="DD/MM/YYYY", help="Set automatically the first time a due date is given"),
                 "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),

@@ -449,7 +449,8 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
         if extra:
             title += ' <span class="muted">&middot; ' + " &middot; ".join(extra) + '</span>'
         if bool(r.get("is_extra", False)):
-            title += ' <span class="xtag">extra</span>'
+            # Tag goes first so a long title can never push it out of view.
+            title = '<span class="xtag" style="margin:0 6px 0 0">extra</span>' + title
         h.append(f'<details class="dl"><summary class="row2"><span class="t" title="{esc(r["deliverable"])}">{title}</span><div class="track">')
         h.append(f'<div class="today" style="left:{pct(today)}%"></div>')
         kind = r.get("kind", "open")

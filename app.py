@@ -1002,7 +1002,14 @@ def render_team_metrics(team_m: dict, today: dt.date, mode_label: str = "Discuss
 
 
 WEEK_COLS = ["Earlier", "2 weeks ago", "Last week", "This week", "Next week", "In 2 weeks", "Later", "No date"]
-LOAD_TINT = {1: "#e6f1fb", 2: "#cde2fb", 3: "#b5d4f4"}
+BLUE_RAMP = ["#e6f1fb", "#cde2fb", "#b5d4f4", "#9ec5f4", "#86b6ef"]    # 1, 2, 3, 4, 5+ items
+RED_RAMP = ["#fcebeb", "#f7c1c1", "#f09595", "#eb7a7a"]
+GREEN_RAMP = ["#eaf3de", "#d6e9bd", "#c0dd97", "#a9d077"]
+
+
+def ramp(colors: list[str], n: int) -> str:
+    """Lighter for few items, darker for many."""
+    return colors[max(1, min(n, len(colors))) - 1]
 WORKLOAD_SHOW = {"Open": "open", "Delivered": "done", "All": "all"}
 CHECK = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="#3b6d11" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M5 12l5 5 9-10"/></svg>'
 
@@ -1058,27 +1065,36 @@ def render_workload(wl: pd.DataFrame, mode_label: str = "All work", show_label: 
             if not v["open"] and not v["done"]:
                 h.append('<td class="c" style="color:var(--t3)">&middot;</td>')
                 continue
-            parts = []
-            if v["open"]:
-                parts.append(f'{v["open"]}' + (f' <small>{v["days"]:g}d</small>' if v["days"] else ""))
-            if v["done"]:
-                parts.append(f'<span style="color:#27500a">{v["done"]}</span>{CHECK}')
-            if v["late"]:
-                tint = "#fcebeb"
-            elif c == "No date" and v["open"]:
-                tint = "#faece7"
-            elif v["open"]:
-                tint = LOAD_TINT.get(v["open"], "#86b6ef")
+            if show_label == "Delivered" and not v["done"]:
+                h.append('<td class="c" style="color:var(--t3)">&middot;</td>')
+                continue
+            days = f' <small>{v["days"]:g}d</small>' if v["days"] else ""
+            if show_label == "Delivered":
+                tint, ink, body = ramp(GREEN_RAMP, v["done"]), "#27500a", f'{v["done"]}{CHECK}'
             else:
-                tint = "#eaf3de"
-            h.append(f'<td class="c" style="background:{tint}">{" &nbsp;".join(parts)}</td>')
+                n = v["open"] + v["done"] if show_label == "All" else v["open"]
+                if not n:
+                    h.append('<td class="c" style="color:var(--t3)">&middot;</td>')
+                    continue
+                if v["late"]:
+                    tint, ink = ramp(RED_RAMP, n), "#791f1f"
+                elif c == "No date" and v["open"]:
+                    tint, ink = "#faece7", "#712b13"
+                else:
+                    tint, ink = ramp(BLUE_RAMP, n), "#0c447c"
+                body = f"{n}{days}"
+            h.append(f'<td class="c" style="background:{tint};color:{ink}">{body}</td>')
         h.append('</tr>')
     h.append('</tbody></table>')
-    h.append('<div class="legend" style="flex-wrap:wrap"><span><span class="sw" style="background:#b5d4f4"></span>open, darker = more</span>'
-             '<span><span class="sw" style="background:#fcebeb"></span>open and past due</span>'
-             '<span><span class="sw" style="background:#eaf3de"></span>delivered</span>'
-             '<span><span class="sw" style="background:#faece7"></span>open, no date</span>'
-             '<span>d = planned days</span></div>')
+    sw = lambda cs: "".join(f'<span class="sw" style="background:{c};margin-right:1px"></span>' for c in cs)  # noqa: E731
+    if show_label == "Delivered":
+        leg = f'<span>{sw(GREEN_RAMP)} delivered, darker = more</span>'
+    else:
+        what = "deliverables" if show_label == "All" else "open"
+        leg = (f'<span>{sw(BLUE_RAMP)} {what}, darker = more</span>'
+               f'<span>{sw(RED_RAMP)} includes open work past its due date</span>'
+               '<span><span class="sw" style="background:#faece7"></span>open, no date</span>')
+    h.append(f'<div class="legend" style="flex-wrap:wrap">{leg}<span>d = planned days still open</span></div>')
     h.append('</div></div>')
     return "".join(h)
 

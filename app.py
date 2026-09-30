@@ -1030,8 +1030,9 @@ def workload(items: pd.DataFrame, names: list[str], today: dt.date) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-def render_workload(wl: pd.DataFrame) -> str:
-    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Workload</span><span class="muted">open deliverables by week of due date &middot; d = planned days</span></div>']
+def render_workload(wl: pd.DataFrame, mode_label: str = "All work") -> str:
+    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Workload</span><span class="muted">'
+         f'{esc(mode_label.lower())} &middot; open deliverables by week of due date &middot; d = planned days</span></div>']
     h.append('<table class="tbl"><colgroup><col>' + '<col style="width:76px">' * len(WEEK_COLS) + '</colgroup>')
     h.append('<thead><tr><th>Person</th>' + "".join(f'<th class="c">{c}</th>' for c in WEEK_COLS) + '</tr></thead><tbody>')
     for _, r in wl.iterrows():
@@ -1316,8 +1317,9 @@ def metrics_tab() -> None:
     per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today, mode)) for n, i in zip(team["name"], team["initials"])]
 
     st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today, mode_label), unsafe_allow_html=True)
-    st.markdown(CSS + METRIC_CSS + render_workload(workload(items, names, today)), unsafe_allow_html=True)
-    st.markdown(CSS + METRIC_CSS + render_blocked(items, today), unsafe_allow_html=True)
+    items_m = by_mode(items, mode)
+    st.markdown(CSS + METRIC_CSS + render_workload(workload(items_m, names, today), mode_label), unsafe_allow_html=True)
+    st.markdown(CSS + METRIC_CSS + render_blocked(items_m, today), unsafe_allow_html=True)
 
     if not st.session_state.get("is_admin"):
         st.info("Per-person metrics and the weekly report are shown after signing in as manager on the Manage tab.")

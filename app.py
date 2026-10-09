@@ -2410,25 +2410,39 @@ with tab_admin:
                          help="Read-only: shows which Jira account the secrets use and how many team tickets it can see"):
                 try:
                     st.info("\n\n".join(jira_check_connection()))
+                except PermissionError as e:
+                    st.error(f"Jira refused the connection: {str(e).splitlines()[0][:200].rstrip('.')}. "
+                             "Check email and api_token under [jira] in the Streamlit secrets: the token must be an API token "
+                             "created by the Atlassian account with that email, pasted whole, between quotes, without spaces.")
                 except (Exception, SystemExit) as e:  # noqa: BLE001
-                    st.error(f"Jira refused the connection: {str(e).splitlines()[0][:200]}. "
-                             "Check [jira] email and api_token in the Streamlit secrets (the token must belong to that email).")
+                    st.error(f"Check connection failed: {str(e).splitlines()[0][:200].rstrip('.') if str(e) else type(e).__name__}. "
+                             "Check base_url and project under [jira] in the Streamlit secrets.")
             _d = jira_diag()
             if isinstance(_d.get("summary"), dict):
                 _sm = _d["summary"]
                 st.caption(f"Last sync: {_sm.get('mode')} &middot; {_sm.get('tickets')} tickets &middot; {_sm.get('seconds')} s"
-                           f" &middot; {_d.get('synced_tickets')} tickets with Jira data in the database", unsafe_allow_html=True)
+                           f" &middot; {_d.get('synced_tickets')} tickets with Jira data in the database"
+                           + (f" &middot; only {_sm['partial'].get('returned')} of {_sm['partial'].get('stored')} stored tickets came back"
+                              if isinstance(_sm.get("partial"), dict) else ""), unsafe_allow_html=True)
             if mode:
                 with st.status(f"{mode.capitalize()} sync from Jira...", expanded=True) as box:
                     try:
                         res = run_jira_sync(mode, log=box.write)
-                        st.session_state["_sync_msg"] = f"Synced {res['tickets']} tickets in {res['seconds']} s."
+                        _auto_sync_state()["last_error"] = None
+                        _p = res.get("partial")
+                        st.session_state["_sync_msg"] = (
+                            ("warning", f"Jira returned only {_p['returned']} tickets against {_p['stored']} stored, so the others "
+                                        "were left as they are. The Jira account in the secrets may have lost access to part of "
+                                        "MYDSUP: press Check connection.") if _p else
+                            ("success", f"Synced {res['tickets']} tickets in {res['seconds']} s."))
                         st.rerun()
                     except (Exception, SystemExit) as e:  # noqa: BLE001
                         box.update(label="Sync failed", state="error")
                         st.error(str(e).splitlines()[0])
             if st.session_state.get("_sync_msg"):
-                st.success(st.session_state.pop("_sync_msg"))
+                _m = st.session_state.pop("_sync_msg")
+                _kind, _text = _m if isinstance(_m, tuple) else ("success", _m)
+                (st.warning if _kind == "warning" else st.success)(_text)
         _err = _auto_sync_state().get("last_error")
         if _err:
             st.caption(f"Last automatic catch-up failed: {_err}")

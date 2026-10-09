@@ -58,7 +58,12 @@ class Jira:
                 time.sleep(min(float(r.headers.get("Retry-After", 2 ** attempt)), 60))
                 continue
             if r.status_code in (401, 403):
-                raise PermissionError(f"Jira refused {method} {path} ({r.status_code}). Check the email/token and permissions.")
+                raise PermissionError(f"Jira refused {method} {path} ({r.status_code}): check the email, the token and the permissions")
+            # Rejected credentials on a search are not an error for Jira: it answers as for an anonymous
+            # visitor (no issues) and only says so in this header. Treat it as the refusal it is.
+            reason = r.headers.get("X-Seraph-LoginReason", "")
+            if "FAILED" in reason or "DENIED" in reason:
+                raise PermissionError(f"Jira did not accept the email/token ({reason}) for {method} {path}")
             r.raise_for_status()
             return r.json() if r.content else {}
         r.raise_for_status()

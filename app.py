@@ -2,19 +2,23 @@
 
 Tab 1 "Team pulse": deliverables + users tables.
 Tab 2 "Tickets":    tickets table (snapshot of the Jira queue).
-Tab "Manage":       password-protected editor for the three tables (manager only).
+Tab "Manage":       editor for the three tables (admin only).
+Sign-in:            accounts and roles (admin / manager / user) from [users.<username>] blocks in the secrets.
 
 Configuration lives in .streamlit/secrets.toml (see secrets.toml.example):
   [connections.supabase] url = "postgresql+psycopg2://..."   Supabase session-pooler URI
-  [admin] password = "..."                                     unlocks the Manage tab
+  [users.sina] password, role = "admin", name = "Sina Kian"  one block per person (see secrets.toml.example)
   [app] snapshot_date = "2026-09-25"                           report date shown on the Tickets tab
   [app] jira_base_url = "https://xxx.atlassian.net"           optional, turns ticket numbers into links
 """
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import hmac
 import json
 import html
+import threading
 
 import pandas as pd
 import streamlit as st
@@ -28,6 +32,7 @@ DELIV_STATUSES = ["Planned", "In progress", "Blocked", "Done", "Cancelled"]
 PRIORITIES = ["Critical", "High", "Medium", "Low"]          # Jira's priority names
 AUTO_SYNC_AFTER_MIN = 30                                      # catch up from Jira when the data is older than this
 KEY_PREFIX = "MYDSUP-"
+APP_BUILD = "2026-10-09 d"                                   # shown in Jira diagnosis: tells which code is live
 
 st.set_page_config(page_title="Daily module", layout="centered")
 
@@ -217,27 +222,34 @@ def jira_diag() -> dict:
     return out
 
 
-def jira_check_connection() -> list[str]:
-    """Read-only: which Jira account the secrets use, and how many team tickets it can see."""
-    from jira_client import Jira
-    j = Jira.from_mapping(st.secrets["jira"])
-    lines = []
-    me = j.get("/rest/api/3/myself")
-    lines.append(f"Connected to Jira as **{me.get('displayName', '?')}**.")
+def jira_check_connection() -> tuple[list[tuple[str, str]], str, str]:
+    """Read-only diagnosis: the live code version, the [jira] secrets described without the token
+    (compare with check_setup.py on the PC that works), and Jira's raw answers. Returns rows, verdict, level."""
+    from jira_client import Jira, describe_config
+    cfg = st.secrets["jira"]
+    rows = [("App version", APP_BUILD)] + [(f"[jira] {k}", str(v)) for k, v in describe_config(cfg).items()]
+    j = Jira.from_mapping(cfg)
+    me = j.probe("/rest/api/3/myself")
+    who = me["body"].get("displayName")
+    rows.append(("Jira sign-in (/myself)", f"HTTP {me['status']}" + (f" - {me['login']}" if me["login"] else "")
+                 + (f" - signed in as {who}" if who else "")))
+    if me["status"] != 200:
+        return rows, ("Jira does not accept this email and token. Compare the fingerprints above with the ones check_setup.py "
+                      "prints on the PC where the sync works: the line that differs is the one to fix in the Streamlit secrets."), "error"
+    n_all = j.probe("/rest/api/3/search/approximate-count", jql=f"project = {j.project}")
+    rows.append((f"{j.project} tickets visible", f"{n_all['body'].get('count')} (HTTP {n_all['status']})"))
     accounts = query("select jira_account_id from users where jira_account_id is not null")
     ids = ",".join(f'"{a}"' for a in accounts["jira_account_id"])
     if not ids:
-        lines.append("No team member is linked to a Jira account: run section 1 of supabase_jira_sync.sql.")
-        return lines
-    n_all = j.post("/rest/api/3/search/approximate-count", {"jql": f"project = {j.project}"}).get("count")
-    n_team = j.post("/rest/api/3/search/approximate-count",
-                    {"jql": f"project = {j.project} AND (assignee in ({ids}) OR assignee was in ({ids}))"}).get("count")
-    lines.append(f"This account can see **{n_all}** {j.project} tickets, **{n_team}** of them handled by the {len(accounts)} linked team members.")
-    if not n_all:
-        lines.append("It cannot see the project at all: check that the token belongs to this email and that the account can open MYDSUP in Jira.")
-    elif not n_team:
-        lines.append("It sees the project but none of the team's tickets: check the jira_account_id values in the users table.")
-    return lines
+        return rows, "No team member is linked to a Jira account: run section 1 of supabase_jira_sync.sql.", "warning"
+    n_team = j.probe("/rest/api/3/search/approximate-count",
+                     jql=f"project = {j.project} AND (assignee in ({ids}) OR assignee was in ({ids}))")
+    rows.append((f"Team tickets visible ({len(accounts)} linked people)", f"{n_team['body'].get('count')} (HTTP {n_team['status']})"))
+    if not n_all["body"].get("count"):
+        return rows, f"Signed in as {who}, but this account cannot see {j.project}. Use the account that can open it.", "error"
+    if not n_team["body"].get("count"):
+        return rows, "The account sees the project but none of the team's tickets: check users.jira_account_id.", "warning"
+    return rows, "The connection is fine. Press Full re-sync.", "success"
 
 
 def load_tickets() -> tuple[pd.DataFrame, dt.date]:
@@ -1114,9 +1126,9 @@ def open_ticket_counts(tickets: pd.DataFrame) -> dict[str, int]:
     return {str(k): int(v) for k, v in op["assignee"].value_counts().items()}
 
 
-def render_team_metrics(team_m: dict, today: dt.date, mode_label: str = "Discussed only") -> str:
+def render_team_metrics(team_m: dict, today: dt.date, mode_label: str = "Discussed only", title: str = "Team metrics") -> str:
     h = ['<div class="dm">']
-    h.append(f'<div class="top"><span class="h1">Team metrics</span><span class="muted">{esc(mode_label.lower())} &middot; {today.strftime("%a %d %b %Y")}</span></div>')
+    h.append(f'<div class="top"><span class="h1">{esc(title)}</span><span class="muted">{esc(mode_label.lower())} &middot; {today.strftime("%a %d %b %Y")}</span></div>')
     h.append('<div class="kpis">')
     tiles = [
         ("Total deliverables", "total", f'{team_m["committed"]} committed &middot; {team_m["uncommitted"]} without a date'),
@@ -1596,8 +1608,8 @@ def render_load(people: list[dict]) -> str:
     return "".join(h)
 
 
-def render_people(people: list[dict], mode_label: str) -> str:
-    h = ['<div class="dm"><div class="pframe"><div class="top"><span class="h1">People</span><span class="muted">only you can see this section</span></div>']
+def render_people(people: list[dict], mode_label: str, title: str = "People", note: str = "only managers can see this section") -> str:
+    h = [f'<div class="dm"><div class="pframe"><div class="top"><span class="h1">{esc(title)}</span><span class="muted">{esc(note)}</span></div>']
     if not people:
         h.append('<p class="sec">No active people in the team yet.</p>')
     else:
@@ -1728,17 +1740,21 @@ def metrics_tab() -> None:
     team_m = metrics_for(items, sum(tk.values()), today, mode)
     per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today, mode)) for n, i in zip(team["name"], team["initials"])]
 
-    st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today, mode_label), unsafe_allow_html=True)
+    st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today, mode_label, "Team metrics" if SEE_ALL else "My metrics"),
+                unsafe_allow_html=True)
     items_m = by_mode(items, mode)
     show_label = st.radio("Workload shows", list(WORKLOAD_SHOW), horizontal=True, key="m_wl",
                           help="Open = still to do, by due date. Delivered = done, by completion date. All = both.")
     st.markdown(CSS + METRIC_CSS + render_workload(workload(items_m, names, today, WORKLOAD_SHOW[show_label]), mode_label, show_label), unsafe_allow_html=True)
     st.markdown(CSS + METRIC_CSS + render_blocked(items_m, today), unsafe_allow_html=True)
 
-    if not st.session_state.get("is_admin"):
-        st.info("Per-person metrics and the weekly report are shown after signing in as manager on the Manage tab.")
-        return
     people = build_people(mode, mode_label)
+    if not SEE_ALL:                                   # a user: the data is already limited to their own work
+        st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_people(people, mode_label, "You", "only you and your managers see this"),
+                    unsafe_allow_html=True)
+        for p in people:
+            st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(p, today), unsafe_allow_html=True)
+        return
     st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_people(people, mode_label), unsafe_allow_html=True)
     if people:
         if st.session_state.get("m_person") is not None and st.session_state["m_person"] not in names:
@@ -2062,13 +2078,13 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
         h.append(f'<div class="tr"><p class="l">{label}</p>{_trend(vals, b, cur, KPI.TEAM_PCT_MIN)}</div>')
     h.append('</div></div>')
 
-    # people: manager only, and only when switched on
-    if admin and not people_on:
+    # people: managers and the admin, and only when switched on; the hint only for the admin, who can switch it
+    if admin and not people_on and IS_ADMIN:
         h.append('<div class="pframe"><p class="sec">Per-person ticket figures are switched off. After the HR/privacy check, set '
-                 '<code>ticket_people_view = true</code> under <code>[app]</code> in the app secrets to show them here, to you only.</p></div>')
+                 '<code>ticket_people_view = true</code> under <code>[app]</code> in the app secrets to show them here, to managers and the admin only.</p></div>')
     if admin and people_on:
         small = any(len(sm[sm["main_owner"] == uid]) > 22 for uid, _, _ in model["people"])
-        h.append('<div class="pframe"><div class="top"><span class="h1">People &middot; tickets</span><span class="muted">only you can see this section</span></div>')
+        h.append('<div class="pframe"><div class="top"><span class="h1">People &middot; tickets</span><span class="muted">only managers can see this section</span></div>')
         h.append('<p class="sec">Naveen works outside Jira and is not shown here.</p>')
         # stayed fixed squares
         h.append(f'<div class="pcard"><div class="top"><span class="h2">Stayed fixed</span><span class="muted">{esc(month.strftime("%B"))} &middot; one square = one ticket</span></div>'
@@ -2168,15 +2184,117 @@ def health_tab() -> None:
     people_on = str(secret("app", "ticket_people_view", "false")).lower() in ("true", "1", "yes")
     label = f"synced {last.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}"
     st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + HEALTH_CSS
-                + render_health(model, month, today, bool(st.session_state.get("is_admin")), people_on, label), unsafe_allow_html=True)
+                + render_health(model, month, today, SEE_ALL, people_on, label), unsafe_allow_html=True)
     with st.expander("How these are measured"):
         st.markdown(HEALTH_HELP)
 
 
 # ----------------------------------------------------------------------------
+# Sign-in. One block per person in the app secrets:
+#   [users.anjali]
+#   password = "..."
+#   role = "user"            # admin: everything and edits / manager: sees everything / user: only their own work
+#   name = "Anjali Mishra"   # full name as in the users table: decides whose work a user sees
+# ----------------------------------------------------------------------------
+ROLES = ("admin", "manager", "user")
+MAX_TRIES, LOCK_MINUTES = 5, 15
+MIN_PASSWORD = 10
+EXAMPLE_PASSWORD = "choose-a-long-password"          # printed in secrets.toml.example in the public repo
+
+
+def usable_password(pw: str) -> bool:
+    """The example password and short ones never open the app (the repo, and so the example, is public)."""
+    return len(pw) >= MIN_PASSWORD and EXAMPLE_PASSWORD not in pw.lower()
+
+
+def accounts() -> dict[str, dict]:
+    """Username (lower case) -> password, role and name, from the [users.<username>] blocks of the secrets."""
+    try:
+        raw = st.secrets["users"]
+    except Exception:  # noqa: BLE001 - no secrets file or no [users] blocks
+        return {}
+    out = {}
+    for user, c in raw.items():
+        if hasattr(c, "get") and usable_password(str(c.get("password", ""))):
+            role = str(c.get("role", "user")).strip().lower()
+            out[str(user).strip().lower()] = {"password": str(c["password"]), "name": str(c.get("name", "")).strip(),
+                                              "role": role if role in ROLES else "user"}   # unknown role: least access
+    return out
+
+
+def _pw_tag(password: str) -> str:
+    """Short fingerprint of a password: a session ends when the password in the secrets changes."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()[:16]
+
+
+@st.cache_resource
+def _login_guard() -> dict:
+    """Wrong attempts per username, shared by every visitor, to slow down password guessing."""
+    return {"lock": threading.Lock(), "fails": {}}
+
+
+def check_login(username: str, password: str) -> tuple[str, dict | None]:
+    """("ok", account), ("wrong", None), or ("locked", None) after MAX_TRIES wrong attempts within LOCK_MINUTES."""
+    user = username.strip().lower()
+    g, now = _login_guard(), dt.datetime.now(dt.timezone.utc)
+    window = dt.timedelta(minutes=LOCK_MINUTES)
+    with g["lock"]:
+        g["fails"] = {u: [t for t in ts if now - t < window] for u, ts in g["fails"].items() if any(now - t < window for t in ts)}
+        if len(g["fails"].get(user, [])) >= MAX_TRIES:
+            return "locked", None
+    acct = accounts().get(user)
+    # constant-time compare, also for unknown usernames, so the answer time does not tell which usernames exist
+    same = hmac.compare_digest(password.encode("utf-8"), (acct["password"] if acct else "\0" * 24).encode("utf-8"))
+    if acct and same:
+        with g["lock"]:
+            g["fails"].pop(user, None)
+        return "ok", acct
+    with g["lock"]:
+        g["fails"].setdefault(user, []).append(now)
+    return "wrong", None
+
+
+def sign_in() -> dict:
+    """The account signed in on this browser tab. Until there is one, shows the sign-in form and stops the page."""
+    accts = accounts()
+    me = st.session_state.get("auth")
+    if me:
+        acct = accts.get(me["user"])
+        if acct and _pw_tag(acct["password"]) == me["tag"]:
+            return {"user": me["user"], "role": acct["role"], "name": acct["name"]}
+        st.session_state.clear()          # account removed or password changed in the secrets: sign in again
+    st.markdown("#### Daily module")
+    if not accts:
+        st.warning("Sign-in is not set up yet. Add one [users.<username>] block per person to the app secrets, "
+                   f"with password (at least {MIN_PASSWORD} characters, not the example one), role and name "
+                   "(see secrets.toml.example).")
+        st.stop()
+    with st.form("sign_in"):
+        user = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        go = st.form_submit_button("Sign in", type="primary")
+    if go:
+        result, acct = check_login(user, pw)
+        if result == "ok":
+            st.session_state["auth"] = {"user": user.strip().lower(), "tag": _pw_tag(acct["password"])}
+            st.rerun()
+        st.error(f"Too many wrong attempts for this username. Try again in {LOCK_MINUTES} minutes."
+                 if result == "locked" else "Wrong username or password.")
+    st.stop()
+
+
+# ----------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------
-tab_pulse, tab_tickets, tab_health, tab_metrics, tab_admin, tab_excel = st.tabs(["Team pulse", "Tickets", "Ticket health", "Metrics", "Manage", "Excel"])
+ACCOUNT = sign_in()
+IS_ADMIN = ACCOUNT["role"] == "admin"                  # sees everything and edits
+SEE_ALL = ACCOUNT["role"] in ("admin", "manager")     # managers see everything, read-only
+
+_who, _out = st.columns([5, 1])
+_who.caption(f"Signed in as **{esc(ACCOUNT['name'] or ACCOUNT['user'])}** &middot; {ACCOUNT['role']}", unsafe_allow_html=True)
+if _out.button("Sign out", key="sign_out", width="stretch"):
+    st.session_state.clear()
+    st.rerun()
 
 maybe_auto_sync()
 try:
@@ -2191,10 +2309,32 @@ today = dt.date.today()
 names = [str(n).strip() for n in team["name"]]
 loaded_at = dt.datetime.now().strftime("%H:%M")
 
+ME = None                                              # a user's own name; None for managers and the admin
+if not SEE_ALL:
+    ME = next((n for n in names if ACCOUNT["name"] and n.lower() == ACCOUNT["name"].lower()), None)
+    if ME is None:
+        st.warning(f"Your sign-in is not linked to anyone in the team yet: no active person is called "
+                   f"\"{ACCOUNT['name'] or '(no name)'}\". Ask the admin to set name under [users.{ACCOUNT['user']}] "
+                   "in the app secrets to your full name as it appears in the dashboard.")
+        st.stop()
+    # a user sees only their own work: every tab below is built from these three tables
+    items = where(items, items["owner"] == ME)
+    team = where(team, team["name"] == ME)
+    tickets = where(tickets, tickets["assignee"] == ME)
+    names = [ME]
+
+_tab_names = ((["Team pulse", "Tickets", "Ticket health", "Metrics"] + (["Manage"] if IS_ADMIN else []) + ["Excel"])
+              if SEE_ALL else ["My work", "My tickets", "My metrics"])
+_tabs = dict(zip(_tab_names, st.tabs(_tab_names)))
+tab_pulse = _tabs["Team pulse" if SEE_ALL else "My work"]
+tab_tickets = _tabs["Tickets" if SEE_ALL else "My tickets"]
+tab_metrics = _tabs["Metrics" if SEE_ALL else "My metrics"]
+tab_health, tab_admin, tab_excel = _tabs.get("Ticket health"), _tabs.get("Manage"), _tabs.get("Excel")
+
 with tab_pulse:
     # Filter row: people and a due-date range. Empty = everyone / all dates.
     f1, f2, f3, f4 = st.columns([2, 1, 1, 1.1])
-    sel = f1.multiselect("People", names, default=[], placeholder="Everyone", key="p_people")
+    sel = f1.multiselect("People", names, default=[], placeholder="Everyone", key="p_people") if SEE_ALL else []
     due_from = f2.date_input("Due from", value=None, format="DD/MM/YYYY", key="p_from")
     due_to = f3.date_input("Due to", value=None, format="DD/MM/YYYY", key="p_to")
     work = MODES[f4.selectbox("Work", ["All work", "Discussed only", "Extras only"], key="p_work",
@@ -2228,7 +2368,7 @@ with tab_tickets:
     tickets = tickets.copy()
     tickets["age"] = [((r if is_date(r) else report_date) - c).days if is_date(c) else 0
                       for c, r in zip(tickets["created"], tickets["resolved"])]
-    team_only = st.toggle("Only tickets assigned to the team", value=True, key="t_team",
+    team_only = SEE_ALL and st.toggle("Only tickets assigned to the team", value=True, key="t_team",
                           help="Off = also tickets once handled by the team but now assigned to someone else")
     if team_only:
         tickets = where(tickets, tickets["on_team"])
@@ -2239,7 +2379,7 @@ with tab_tickets:
     # Filters. Empty = all.
     g0, g1, g2, g3, g4, g5 = st.columns([0.9, 1.4, 1, 1, 1.4, 1.2])
     f_state = g0.selectbox("State", ["Open", "Closed", "All"], key="t_state")
-    f_asg = g1.multiselect("Assignee", opts("assignee"), default=[], placeholder="Everyone", key="t_asg")
+    f_asg = g1.multiselect("Assignee", opts("assignee"), default=[], placeholder="Everyone", key="t_asg") if SEE_ALL else []
     c_from = g2.date_input("Created from", value=None, format="DD/MM/YYYY", key="t_from")
     c_to = g3.date_input("Created to", value=None, format="DD/MM/YYYY", key="t_to")
     q = g4.text_input("Search", value="", placeholder="number or words in summary", key="t_q").strip().lower()
@@ -2259,10 +2399,7 @@ with tab_tickets:
         ]
     sel_t = where(tickets, mask).copy()
 
-    if f_asg and not st.session_state.get("is_admin"):
-        st.caption("Totals are hidden while a person is selected: per-person ticket counts are for the manager only.")
-    else:
-        st.markdown(CSS + render_tickets(sel_t, len(tickets), report_date, bool(st.session_state.get("is_admin"))), unsafe_allow_html=True)
+    st.markdown(CSS + render_tickets(sel_t, len(tickets), report_date, SEE_ALL), unsafe_allow_html=True)
 
     sel_t["_prio"] = [PRIO_ORDER.get(p, 9) for p in sel_t["priority"]]
     sel_t["_created"] = [c if is_date(c) else dt.date(1900, 1, 1) for c in sel_t["created"]]
@@ -2289,11 +2426,12 @@ with tab_tickets:
         st.cache_data.clear()
         st.rerun()
 
-with tab_health:
-    try:
-        health_tab()
-    except Exception as e:  # noqa: BLE001 - keep the other tabs working
-        st.error(f"Ticket health could not be shown right now: {str(e).splitlines()[0][:200]}")
+if tab_health is not None:
+    with tab_health:
+        try:
+            health_tab()
+        except Exception as e:  # noqa: BLE001 - keep the other tabs working
+            st.error(f"Ticket health could not be shown right now: {str(e).splitlines()[0][:200]}")
 
 
 def excel_tab() -> None:
@@ -2306,8 +2444,8 @@ def excel_tab() -> None:
     )
 
     st.markdown("**Import**", unsafe_allow_html=True)
-    if not st.session_state.get("is_admin"):
-        st.info("Importing writes to the database. Sign in as manager on the Manage tab first.")
+    if not IS_ADMIN:
+        st.info("Importing writes to the database, so it is for the admin only.")
         return
     up = st.file_uploader("Upload a workbook in the Daily module layout", type=["xlsx"], key="x_up")
     swap_dm = st.checkbox("Dates were typed as day/month but Excel stored them as month/day: swap them", value=False, key="x_swap")
@@ -2372,29 +2510,16 @@ with tab_metrics:
     metrics_tab()
 
 
-with tab_excel:
-    excel_tab()
+if tab_excel is not None:
+    with tab_excel:
+        excel_tab()
 
+
+if tab_admin is None:                                 # Manage is for the admin only, and it is the end of the page
+    st.stop()
 
 with tab_admin:
-    admin_pw = str(secret("admin", "password", ""))
-    if not st.session_state.get("is_admin"):
-        st.markdown("**Manage the data** &middot; for the manager only", unsafe_allow_html=True)
-        if not admin_pw:
-            st.warning("No admin password set. Add [admin] password = \"...\" to secrets.toml.")
-        pw = st.text_input("Password", type="password", key="admin_pw")
-        if st.button("Sign in", key="admin_login"):
-            if admin_pw and pw == admin_pw:
-                st.session_state["is_admin"] = True
-                st.rerun()
-            st.error("Wrong password.")
-        st.stop()
-
-    top1, top2 = st.columns([4, 1])
-    top1.caption("Signed in as manager. Changes go straight to Supabase and appear on the other tabs after Save.")
-    if top2.button("Sign out", key="admin_logout", width="stretch"):
-        st.session_state["is_admin"] = False
-        st.rerun()
+    st.caption("Changes go straight to Supabase and appear on the other tabs after Save.")
 
     with st.expander("Jira sync", expanded=False):
         _ls = last_sync_at()
@@ -2409,7 +2534,10 @@ with tab_admin:
             if j3.button("Check connection", key="jira_check", width="stretch",
                          help="Read-only: shows which Jira account the secrets use and how many team tickets it can see"):
                 try:
-                    st.info("\n\n".join(jira_check_connection()))
+                    _rows, _verdict, _level = jira_check_connection()
+                    st.markdown("| Check | Result |\n|---|---|\n" + "\n".join(
+                        f"| {esc(a)} | {esc(b)} |" for a, b in _rows))
+                    {"error": st.error, "warning": st.warning}.get(_level, st.success)(_verdict)
                 except PermissionError as e:
                     st.error(f"Jira refused the connection: {str(e).splitlines()[0][:200].rstrip('.')}. "
                              "Check email and api_token under [jira] in the Streamlit secrets: the token must be an API token "

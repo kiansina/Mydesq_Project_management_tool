@@ -256,7 +256,14 @@ def _purge_old(engine: sa.Engine, store: "Store", cutoff: dt.datetime) -> None:
 def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print, workers: int = 4) -> dict:
     store = Store(engine)
     people = store.people()
+    # Sign in first: with a wrong email/token Jira answers searches as for an anonymous visitor (no tickets,
+    # no error). /myself refuses instead (401), so bad credentials stop here, before anything is written.
+    me = jira.get("/rest/api/3/myself")
+    log(f"signed in to Jira as {me.get('displayName', '?')}")
     started = dt.datetime.now(UTC)
+    tk = store.t["tickets"]
+    with engine.connect() as c:                   # tickets already holding Jira data, for the safety check below
+        had = c.execute(sa.select(sa.func.count()).select_from(tk).where(tk.c.jira_key.is_not(None))).scalar() or 0
     ids = ",".join(f'"{a}"' for a in people.team)
     jql = f"project = {jira.project} AND (assignee in ({ids}) OR assignee was in ({ids}))"
     last = store.get_state("last_sync_at")
@@ -269,6 +276,9 @@ def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print
     log(f"{mode} sync: {'changed and open tickets' if mode != 'full' else 'all tickets'}")
     issues = list(jira.search(jql + " ORDER BY updated ASC", FIELDS, expand="changelog", page=50))
     log(f"{len(issues)} tickets to sync")
+    if mode == "full" and not issues:
+        raise RuntimeError(f"Jira returned no {jira.project} tickets for the team, so nothing was changed. "
+                           "Check that the Jira account in the secrets can open the project.")
     cutoff = dt.datetime(started.year - 1, 1, 1, tzinfo=UTC)      # retention: current and previous year
     if mode == "full":
         _purge_old(engine, store, cutoff)
@@ -288,13 +298,18 @@ def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print
     done += len(batch)
     summary = {"mode": mode, "tickets": done, "started": started.isoformat(),
                "seconds": round((dt.datetime.now(UTC) - started).total_seconds(), 1)}
+    # far fewer tickets than stored: more likely lost permissions than half the tickets gone
+    partial = mode == "full" and done < had / 2
+    if partial:
+        summary["partial"] = {"returned": done, "stored": had}
     with engine.begin() as c:
         store.set_state(c, "last_sync_at", started.isoformat())
         store.set_state(c, "last_sync_summary", json.dumps(summary))
-        if mode == "full":
+        if partial:
+            log(f"only {done} tickets returned against {had} stored: tickets not returned were left as they are")
+        elif mode == "full":
             store.set_state(c, "last_full_sync_at", started.isoformat())
             # tickets Jira no longer returns (deleted, moved out of MYDSUP, old snapshot rows): close them, drop their history
-            tk = store.t["tickets"]
             stale = sa.or_(tk.c.synced_at.is_(None), tk.c.synced_at < started)
             gone = sa.select(tk.c.ticket_id).where(stale).scalar_subquery()
             for name in ("jira_events", "jira_comments", "jira_sla"):

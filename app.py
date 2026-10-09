@@ -13,6 +13,7 @@ Configuration lives in .streamlit/secrets.toml (see secrets.toml.example):
 from __future__ import annotations
 
 import datetime as dt
+import json
 import html
 
 import pandas as pd
@@ -194,6 +195,49 @@ def maybe_auto_sync() -> None:
     import threading
     threading.Thread(target=work, daemon=True).start()
     st.toast("Fetching the latest Jira changes in the background. Refresh in a minute to see them.")  # noqa: E501
+
+
+def jira_diag() -> dict:
+    """What the database holds for the Jira sync. Used to explain an empty Ticket health page."""
+    out = {}
+    for name, sql in [("linked_people", "select count(*) from users where jira_account_id is not null"),
+                      ("synced_tickets", "select count(*) from tickets where jira_key is not null"),
+                      ("events", "select count(*) from jira_events"),
+                      ("statuses", "select count(*) from jira_status_map"),
+                      ("summary", "select value from sync_state where key = 'last_sync_summary'")]:
+        try:
+            v = query(sql)
+            out[name] = v.iloc[0, 0] if len(v) else None
+        except Exception as e:  # noqa: BLE001
+            out[name] = "error: " + str(e).splitlines()[0][:160]
+    try:
+        out["summary"] = json.loads(out["summary"]) if isinstance(out.get("summary"), str) and not out["summary"].startswith("error") else out.get("summary")
+    except ValueError:
+        pass
+    return out
+
+
+def jira_check_connection() -> list[str]:
+    """Read-only: which Jira account the secrets use, and how many team tickets it can see."""
+    from jira_client import Jira
+    j = Jira.from_mapping(st.secrets["jira"])
+    lines = []
+    me = j.get("/rest/api/3/myself")
+    lines.append(f"Connected to Jira as **{me.get('displayName', '?')}**.")
+    accounts = query("select jira_account_id from users where jira_account_id is not null")
+    ids = ",".join(f'"{a}"' for a in accounts["jira_account_id"])
+    if not ids:
+        lines.append("No team member is linked to a Jira account: run section 1 of supabase_jira_sync.sql.")
+        return lines
+    n_all = j.post("/rest/api/3/search/approximate-count", {"jql": f"project = {j.project}"}).get("count")
+    n_team = j.post("/rest/api/3/search/approximate-count",
+                    {"jql": f"project = {j.project} AND (assignee in ({ids}) OR assignee was in ({ids}))"}).get("count")
+    lines.append(f"This account can see **{n_all}** {j.project} tickets, **{n_team}** of them handled by the {len(accounts)} linked team members.")
+    if not n_all:
+        lines.append("It cannot see the project at all: check that the token belongs to this email and that the account can open MYDSUP in Jira.")
+    elif not n_team:
+        lines.append("It sees the project but none of the team's tickets: check the jira_account_id values in the users table.")
+    return lines
 
 
 def load_tickets() -> tuple[pd.DataFrame, dt.date]:
@@ -775,7 +819,7 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
 
 def editor(spec: dict, df: pd.DataFrame, lookups: dict, key: str) -> None:
     st.data_editor(
-        df, key=key, num_rows="dynamic", hide_index=True, use_container_width=True,
+        df, key=key, num_rows="dynamic", hide_index=True, width="stretch",
         column_config=spec["config"], disabled=spec.get("disabled", []),
     )
     state = st.session_state.get(key, {"edited_rows": {}, "added_rows": [], "deleted_rows": []})
@@ -1790,10 +1834,10 @@ def health_model(sync_key: str) -> dict | None:
     except Exception as e:  # noqa: BLE001
         msg = str(e).lower()
         if "does not exist" in msg or "no such table" in msg or "no such column" in msg or "undefined" in msg:
-            return None          # the Jira tables are not there yet
+            return {"problem": "missing", "detail": str(e).splitlines()[0][:300]}
         raise                    # anything else: not cached, shown to the user, retried next time
     if tks.empty:
-        return None
+        return {"problem": "empty"}
     try:
         hol = query("select day from holidays")
         KPI.HOLIDAYS = {pd.Timestamp(d).date() for d in hol["day"]}
@@ -2096,8 +2140,26 @@ def health_tab() -> None:
         st.info("No Jira data yet. Run supabase_jira_sync.sql in Supabase, then a first sync (Manage tab, or the GitHub job).")
         return
     model = health_model(last.isoformat())
-    if model is None:
-        st.info("The Jira tables are not there yet. Run supabase_jira_sync.sql in Supabase, then a first sync.")
+    if model is None or "problem" in model:
+        health_model.clear()                      # re-check on the next visit instead of caching the problem
+        if model and model["problem"] == "missing":
+            st.warning("Part of the Jira setup is missing in the database, so Ticket health cannot be built.")
+            st.code(model["detail"])
+            st.caption("Run supabase_jira_sync.sql in the Supabase SQL Editor again (it is safe to run twice), then reload this page.")
+            return
+        d = jira_diag()
+        summ = d.get("summary") if isinstance(d.get("summary"), dict) else {}
+        st.warning("The last Jira sync stored no tickets for the team, so there is nothing to measure yet.")
+        st.markdown(
+            f"- Last sync: **{summ.get('mode', '?')}**, **{summ.get('tickets', '?')}** tickets, at {last.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}\n"
+            f"- Team members linked to Jira: **{d.get('linked_people')}** (expected 5)\n"
+            f"- Tickets with Jira data in the database: **{d.get('synced_tickets')}**\n"
+            f"- Status map rows: **{d.get('statuses')}** (expected 9)")
+        if d.get("linked_people") in (0, None) or str(d.get("linked_people")).startswith("error"):
+            st.caption("Nobody is linked to a Jira account: run supabase_jira_sync.sql (section 1 links the five people), then Full re-sync.")
+        else:
+            st.caption("Most likely the Jira account in the Streamlit secrets cannot see the team's MYDSUP tickets. "
+                       "Sign in on Manage, open Jira sync and press Check connection: it shows which account is used and what it can see.")
         return
     menu = _months_menu(today, model["base"].year)
     default = 1 if len(menu) > 1 else 0          # last full month
@@ -2158,7 +2220,7 @@ with tab_pulse:
 
     c1, c2 = st.columns([4, 1])
     c1.caption(f"Source: Supabase &middot; loaded {loaded_at} &middot; {len(items)} deliverables", unsafe_allow_html=True)
-    if c2.button("Refresh", use_container_width=True, key="p_refresh"):
+    if c2.button("Refresh", width="stretch", key="p_refresh"):
         st.cache_data.clear()
         st.rerun()
 
@@ -2222,8 +2284,8 @@ with tab_tickets:
     _ls = last_sync_at()
     c1.caption(f"Source: Jira, synced {_ls.astimezone(KPI.WORK_TZ):%d %b %H:%M}" if _ls else f"Source: Supabase &middot; snapshot {report_date:%d %b %Y}",
                unsafe_allow_html=True)
-    c2.download_button("Download CSV", csv.to_csv(index=False).encode("utf-8-sig"), file_name=f"tickets_{report_date:%Y%m%d}.csv", mime="text/csv", use_container_width=True, key="t_dl")
-    if c3.button("Refresh", use_container_width=True, key="t_refresh"):
+    c2.download_button("Download CSV", csv.to_csv(index=False).encode("utf-8-sig"), file_name=f"tickets_{report_date:%Y%m%d}.csv", mime="text/csv", width="stretch", key="t_dl")
+    if c3.button("Refresh", width="stretch", key="t_refresh"):
         st.cache_data.clear()
         st.rerun()
 
@@ -2272,7 +2334,7 @@ def excel_tab() -> None:
         st.caption(f"{len(cand)} rows read &middot; {len(ok)} ready to insert &middot; {len(cand) - len(ok)} skipped (see Problem)", unsafe_allow_html=True)
         st.dataframe(
             cand[["sheet", "row", "owner", "deliverable", "is_extra", "discussed_on", "due_date", "ticket_id", "status", "notes", "problem"]],
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
             column_config={
                 "discussed_on": st.column_config.DateColumn("Discussed", format="DD/MM/YYYY"),
                 "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),
@@ -2330,7 +2392,7 @@ with tab_admin:
 
     top1, top2 = st.columns([4, 1])
     top1.caption("Signed in as manager. Changes go straight to Supabase and appear on the other tabs after Save.")
-    if top2.button("Sign out", key="admin_logout", use_container_width=True):
+    if top2.button("Sign out", key="admin_logout", width="stretch"):
         st.session_state["is_admin"] = False
         st.rerun()
 
@@ -2341,9 +2403,21 @@ with tab_admin:
         if not secret("jira", "api_token", ""):
             st.info("To sync from here, add a [jira] section to the app secrets: base_url, email, api_token, project.")
         else:
-            j1, j2 = st.columns(2)
-            mode = "incremental" if j1.button("Sync changes now", key="jira_inc", use_container_width=True) else (
-                "full" if j2.button("Full re-sync (about 10 minutes)", key="jira_full", use_container_width=True) else None)
+            j1, j2, j3 = st.columns(3)
+            mode = "incremental" if j1.button("Sync changes now", key="jira_inc", width="stretch") else (
+                "full" if j2.button("Full re-sync (about 3 minutes)", key="jira_full", width="stretch") else None)
+            if j3.button("Check connection", key="jira_check", width="stretch",
+                         help="Read-only: shows which Jira account the secrets use and how many team tickets it can see"):
+                try:
+                    st.info("\n\n".join(jira_check_connection()))
+                except (Exception, SystemExit) as e:  # noqa: BLE001
+                    st.error(f"Jira refused the connection: {str(e).splitlines()[0][:200]}. "
+                             "Check [jira] email and api_token in the Streamlit secrets (the token must belong to that email).")
+            _d = jira_diag()
+            if isinstance(_d.get("summary"), dict):
+                _sm = _d["summary"]
+                st.caption(f"Last sync: {_sm.get('mode')} &middot; {_sm.get('tickets')} tickets &middot; {_sm.get('seconds')} s"
+                           f" &middot; {_d.get('synced_tickets')} tickets with Jira data in the database", unsafe_allow_html=True)
             if mode:
                 with st.status(f"{mode.capitalize()} sync from Jira...", expanded=True) as box:
                     try:

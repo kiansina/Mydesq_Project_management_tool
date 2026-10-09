@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.venv/
+
+# Jira sync (local runs only)
+jira_secrets.toml

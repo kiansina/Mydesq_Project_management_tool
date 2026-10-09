@@ -20,9 +20,12 @@ import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+import ticket_kpis as KPI
+
 OPEN_STATUSES = {"Planned", "In progress", "Blocked"}
 DELIV_STATUSES = ["Planned", "In progress", "Blocked", "Done", "Cancelled"]
-PRIORITIES = ["Highest", "High", "Normal", "Low", "Lowest"]
+PRIORITIES = ["Critical", "High", "Medium", "Low"]          # Jira's priority names
+AUTO_SYNC_AFTER_MIN = 30                                      # catch up from Jira when the data is older than this
 KEY_PREFIX = "MYDSUP-"
 
 st.set_page_config(page_title="Daily module", layout="centered")
@@ -35,8 +38,11 @@ def secret(section: str, key: str, default=""):
         return default
 
 
-JIRA = str(secret("app", "jira_base_url", "")).rstrip("/")
+JIRA = str(secret("app", "jira_base_url", "") or secret("jira", "base_url", "") or "https://mydesq.atlassian.net").rstrip("/")
 SNAPSHOT = pd.to_datetime(secret("app", "snapshot_date", dt.date.today())).date()
+# Per-person ticket figures (Ticket health people cards, open tickets per person, nudge avatars):
+# off until HR/privacy has agreed. Set [app] ticket_people_view = true in the secrets.
+PEOPLE_TICKETS = str(secret("app", "ticket_people_view", "false")).lower() in ("true", "1", "yes")
 
 
 # ----------------------------------------------------------------------------
@@ -60,7 +66,12 @@ def fmt(d) -> str:
 
 
 def esc(s) -> str:
-    return html.escape("" if s is None or (isinstance(s, float) and pd.isna(s)) else str(s))
+    """HTML-escape and fold all whitespace (incl. line breaks) into single spaces.
+
+    A blank line inside st.markdown HTML ends the HTML block and the rest of the
+    section would show as raw text, so no value may carry a newline into the page.
+    """
+    return html.escape("" if s is None or (isinstance(s, float) and pd.isna(s)) else " ".join(str(s).split()))
 
 
 def plural(n: int, word: str) -> str:
@@ -122,30 +133,113 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
     return items, team
 
 
+def last_sync_at() -> dt.datetime | None:
+    """When the Jira sync last finished (UTC), or None before the first sync / before the Jira tables exist."""
+    try:
+        v = query("select value from sync_state where key = 'last_sync_at'")
+    except Exception:  # noqa: BLE001 - table missing until supabase_jira_sync.sql has run
+        return None
+    if v.empty or not v.iloc[0, 0]:
+        return None
+    return pd.to_datetime(v.iloc[0, 0], utc=True).to_pydatetime()
+
+
+def run_jira_sync(mode: str, log=None) -> dict | None:
+    """Pull changes from Jira into the database with the [jira] secrets. Read-only on Jira."""
+    from jira_client import Jira
+    from jira_sync import run_sync
+    cfg = st.secrets["jira"]
+    res = run_sync(conn().engine, Jira.from_mapping(cfg), mode, log=log or (lambda m: None))
+    st.cache_data.clear()
+    return res
+
+
+@st.cache_resource
+def _auto_sync_state() -> dict:
+    import threading
+    return {"lock": threading.Lock(), "last_try": None, "last_error": None}
+
+
+def maybe_auto_sync() -> None:
+    """If the data is more than an hour old, fetch the latest Jira changes in the background.
+
+    Never blocks the page: one sync at a time for the whole app, and no new attempt within
+    15 minutes of the previous one (so a Jira outage cannot slow every visit down)."""
+    if not secret("jira", "api_token", ""):
+        return
+    last = last_sync_at()
+    now = dt.datetime.now(dt.timezone.utc)
+    if last is None or now - last < dt.timedelta(minutes=AUTO_SYNC_AFTER_MIN):
+        return
+    state = _auto_sync_state()
+    if state["last_try"] and now - state["last_try"] < dt.timedelta(minutes=15):
+        return
+    if not state["lock"].acquire(blocking=False):
+        return
+    state["last_try"] = now
+    cfg, engine = dict(st.secrets["jira"]), conn().engine
+
+    def work():
+        from jira_client import Jira
+        from jira_sync import run_sync
+        try:
+            run_sync(engine, Jira.from_mapping(cfg), "incremental", log=lambda m: None)
+            state["last_error"] = None
+            st.cache_data.clear()
+        except BaseException as e:  # noqa: BLE001 - background: record and move on
+            state["last_error"] = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+        finally:
+            state["lock"].release()
+
+    import threading
+    threading.Thread(target=work, daemon=True).start()
+    st.toast("Fetching the latest Jira changes in the background. Refresh in a minute to see them.")  # noqa: E501
+
+
 def load_tickets() -> tuple[pd.DataFrame, dt.date]:
-    t = query("""
-        select t.ticket_id                         as number,
-               'MYDSUP-' || t.ticket_id            as key,
-               t.summary,
-               t.priority,
-               coalesce(u.full_name, 'Unassigned') as assignee,
-               coalesce(t.organization, '')        as organization,
-               t.created_on                        as created,
-               coalesce(t.state, 'Open')           as state
-        from tickets t
-        left join users u on u.user_id = t.assignee_id
-        order by t.ticket_id
-    """)
+    try:
+        t = query("""
+            select t.ticket_id                                          as number,
+                   coalesce(t.jira_key, 'MYDSUP-' || t.ticket_id)       as key,
+                   t.summary,
+                   t.priority,
+                   coalesce(u.full_name, t.assignee_name, 'Unassigned') as assignee,
+                   case when t.assignee_id is null then 0 else 1 end    as on_team,
+                   coalesce(t.organization, '')                         as organization,
+                   t.created_on                                         as created,
+                   coalesce(t.state, 'Open')                            as state,
+                   coalesce(t.jira_status, '')                          as jira_status,
+                   t.resolved_at
+            from tickets t
+            left join users u on u.user_id = t.assignee_id
+            order by t.ticket_id
+        """)
+    except Exception:  # noqa: BLE001 - before supabase_jira_sync.sql: the manual snapshot columns only
+        t = query("""
+            select t.ticket_id as number, 'MYDSUP-' || t.ticket_id as key, t.summary, t.priority,
+                   coalesce(u.full_name, 'Unassigned') as assignee,
+                   case when t.assignee_id is null then 0 else 1 end as on_team,
+                   coalesce(t.organization, '') as organization, t.created_on as created,
+                   coalesce(t.state, 'Open') as state
+            from tickets t left join users u on u.user_id = t.assignee_id
+            order by t.ticket_id
+        """)
+        t["jira_status"] = ""
+        t["resolved_at"] = None
     t["created"] = to_dates(t["created"])
+    t["resolved"] = [d.date() if d is not None and not pd.isna(d) else None
+                     for d in pd.to_datetime(t["resolved_at"], errors="coerce", utc=True)]
     t["number"] = pd.to_numeric(t["number"], errors="coerce").fillna(0).astype(int)
-    for c in ["key", "summary", "priority", "assignee", "organization", "state"]:
+    t["on_team"] = pd.to_numeric(t["on_team"], errors="coerce").fillna(0).astype(int).astype(bool)
+    for c in ["key", "summary", "priority", "assignee", "organization", "state", "jira_status"]:
         t[c] = t[c].astype(str).str.strip()
-    t["priority"] = t["priority"].replace("", "Normal")
+    t["priority"] = t["priority"].replace("", "Medium")
     t["state"] = t["state"].replace("", "Open")
     # Columns the shared rendering code reads but the database does not store.
     t["type"] = ""
     t["internal_status"] = ["Resolved" if st_ == "Closed" else "Open" for st_ in t["state"]]
-    return t, SNAPSHOT
+    last = last_sync_at()
+    return t, (last.astimezone(KPI.WORK_TZ).date() if last else SNAPSHOT)
 
 
 # ----------------------------------------------------------------------------
@@ -385,7 +479,7 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
 
     # KPI tiles
     rate = "&mdash;" if m["rate"] is None else f'{m["rate"]}%'
-    rate_d = "no closures yet" if m["rate"] is None else f'{m["closed"]} closed &middot; {m["reliability"]}% kept their date'
+    rate_d = "no closures yet" if m["rate"] is None else f'{m["closed"]} closed &middot; date never moved on {m["reliability"]}%'
     soon_d = "nothing due" if not m["due_soon"] else f'latest {fmt(m["due_soon_last"])}'
     need_d = "agree one at stand-up" if m["need_date"] else "everyone has a date"
     if m["past"]:
@@ -527,15 +621,16 @@ def bars(title: str, rows: list[tuple[str, int, int]], note: str = "") -> str:
     return "".join(h)
 
 
-PRIO_TINT = {"Highest": "#fcebeb", "High": "#faeeda", "Lowest": "#f1efe8"}
-PRIO_ORDER = {"Highest": 0, "High": 1, "Normal": 2, "Lowest": 3}
+PRIO_TINT = {"Critical": "#fcebeb", "Highest": "#fcebeb", "High": "#faeeda", "Low": "#f1efe8", "Lowest": "#f1efe8"}
+PRIO_ORDER = {"Critical": 0, "Highest": 0, "High": 1, "Medium": 2, "Normal": 2, "Low": 3, "Lowest": 3}
+PRIO_LEGEND = [("Critical", "#fcebeb"), ("High", "#faeeda"), ("Medium", "var(--s2)"), ("Low", "#f1efe8")]
 
 
-def render_tickets(t: pd.DataFrame, total_in_scope: int, report_date: dt.date) -> str:
+def render_tickets(t: pd.DataFrame, total_in_scope: int, report_date: dt.date, admin: bool = False) -> str:
     h = ['<div class="dm">']
-    h.append(f'<div class="top"><span class="h1">Ticket snapshot</span><span class="muted">as of {report_date.strftime("%a %d %b %Y")} &middot; {plural(total_in_scope, "ticket")} in scope</span></div>')
+    h.append(f'<div class="top"><span class="h1">Tickets</span><span class="muted">from Jira &middot; as of {report_date.strftime("%a %d %b %Y")} &middot; {plural(total_in_scope, "ticket")} in scope</span></div>')
 
-    hot = int(t["priority"].isin(["Highest", "High"]).sum())
+    hot = int(t["priority"].isin(["Critical", "Highest", "High"]).sum())
     old = int((t["age"] > 90).sum())
     recent = int((t["age"] <= 30).sum())
     dated = [c for c in t["created"] if is_date(c)]
@@ -560,7 +655,8 @@ def render_tickets(t: pd.DataFrame, total_in_scope: int, report_date: dt.date) -
         by_age.append((label, len(g), int((g["internal_status"] == "Resolved").sum())))
 
     h.append('<div class="block two">')
-    h.append(bars("By assignee", by_asg))
+    if admin:   # a per-person ticket count is volume, so only the manager sees it
+        h.append(bars("By assignee", by_asg))
     h.append(bars("By age", by_age, f"days since created, at {report_date.strftime('%d %b')}"))
     h.append('</div>')
     if resolved:
@@ -573,8 +669,8 @@ def tickets_table(show: pd.DataFrame, jira: str) -> str:
     """Compact five-column table, full width, priority as a row tint."""
     h = ['<div class="dm">']
     h.append(f'<p class="h2" style="margin-top:20px">Tickets &middot; {len(show)}</p>')
-    h.append('<table class="tbl"><colgroup><col style="width:62px"><col><col style="width:150px"><col style="width:96px"><col style="width:58px"></colgroup>')
-    h.append('<thead><tr><th>No.</th><th>Summary</th><th>Assignee</th><th>Created</th><th class="r">Age</th></tr></thead><tbody>')
+    h.append('<table class="tbl"><colgroup><col style="width:62px"><col><col style="width:116px"><col style="width:138px"><col style="width:92px"><col style="width:50px"></colgroup>')
+    h.append('<thead><tr><th>No.</th><th>Summary</th><th>Status</th><th>Assignee</th><th>Created</th><th class="r">Age</th></tr></thead><tbody>')
     for _, r in show.iterrows():
         tint = PRIO_TINT.get(r["priority"], "")
         style = f' style="background:{tint}"' if tint else ""
@@ -582,12 +678,14 @@ def tickets_table(show: pd.DataFrame, jira: str) -> str:
         if jira:
             num = f'<a href="{esc(jira)}/browse/{esc(r["key"])}" target="_blank">{num}</a>'
         created = r["created"].strftime("%d/%m/%Y") if is_date(r["created"]) else ""
-        closed = ' <span class="pill ok" style="font-size:11px;padding:1px 6px">closed</span>' if str(r.get("state", "")) == "Closed" else ""
-        h.append(f'<tr{style} title="{esc(r["key"])} &middot; {esc(r["priority"])} &middot; {esc(r.get("state", ""))}"><td class="num">{num}</td><td>{esc(r["summary"])}{closed}</td><td>{esc(r["assignee"])}</td><td class="num">{created}</td><td class="r num">{int(r["age"])}</td></tr>')
+        status = str(r.get("jira_status", "") or "") or ("Closed" if str(r.get("state", "")) == "Closed" else "Open")
+        done = str(r.get("state", "")) == "Closed"
+        stat = f'<span style="color:{"#3b6d11" if done else "var(--t1)"}">{esc(status)}</span>'
+        h.append(f'<tr{style} title="{esc(r["key"])} &middot; {esc(r["priority"])} priority &middot; {esc(r.get("state", ""))}"><td class="num">{num}</td><td>{esc(r["summary"])}</td><td style="font-size:12px">{stat}</td><td>{esc(r["assignee"])}</td><td class="num">{created}</td><td class="r num">{int(r["age"])}</td></tr>')
     h.append('</tbody></table>')
     h.append('<div class="legend"><span>Row tint = priority:</span>'
-             + "".join(f'<span><span class="sw" style="background:{c};border:0.5px solid var(--b)"></span>{p}</span>' for p, c in PRIO_TINT.items())
-             + '<span><span class="sw" style="background:var(--s2);border:0.5px solid var(--b)"></span>Normal</span><span>&middot; Age = days since created, at snapshot date</span></div>')
+             + "".join(f'<span><span class="sw" style="background:{c};border:0.5px solid var(--b)"></span>{p}</span>' for p, c in PRIO_LEGEND)
+             + '<span>&middot; Age = days open (to resolution for closed tickets)</span></div>')
     h.append('</div>')
     return "".join(h)
 
@@ -849,7 +947,7 @@ METRIC_LABELS = [
     ("total", "Total"), ("committed", "Committed"), ("uncommitted", "No date yet"), ("completed", "Completed"),
     ("on_time", "On time"), ("delayed", "Delayed"), ("rate", "On-time rate"), ("avg_delay", "Average delay"),
     ("wip", "In progress"), ("cycle", "Cycle time"), ("aging", "Oldest open"), ("tickets", "Open tickets"),
-    ("reliability", "Kept their date"), ("variance", "Schedule variance"), ("blocked", "Blocked"), ("planned", "Planned days open"),
+    ("reliability", "Date never moved"), ("variance", "Schedule variance"), ("blocked", "Blocked"), ("planned", "Planned days open"),
     ("extras", "Extra tasks"),
 ]
 METRIC_HELP = {
@@ -952,16 +1050,6 @@ def metrics_for(df: pd.DataFrame, open_tickets: int, today: dt.date, mode: str =
     return m
 
 
-def extras_cell(m: dict, scale: int) -> str:
-    n = m.get("extras", 0)
-    if not n:
-        return '<span class="mnone">none</span>'
-    w = round(100 * n / max(scale, 1), 1)
-    return (f'<div class="stackrow" title="{m["extras_done"]} done, {m["extras_open"]} open">'
-            f'<div class="stack" style="width:{w}%"><span style="flex:1 1 0;background:#7f77dd;border-radius:0 4px 4px 0"></span></div>'
-            f'<span class="cnt">{n}</span></div>')
-
-
 def show_metric(key: str, m: dict) -> str:
     v = m.get(key)
     if v is None:
@@ -991,7 +1079,7 @@ def render_team_metrics(team_m: dict, today: dt.date, mode_label: str = "Discuss
         ("Completed", "completed", f'{team_m["on_time"]} on time'),
         ("On-time rate", "rate", "of completed with a due date"),
         ("Delayed", "delayed", f'{team_m["delayed_open"]} still open'),
-        ("Kept their date", "reliability", "due date never moved"),
+        ("Date never moved", "reliability", "since the first promise"),
         ("Cycle time", "cycle", "discussed to completed"),
         ("Extra tasks", "extras", f'{team_m["extras_done"]} done &middot; {team_m["extras_open"]} open'),
     ]
@@ -1124,13 +1212,16 @@ def render_person_cards(per: list[tuple[str, str, dict]]) -> str:
     for name, ini, m in per:
         h.append(f'<div class="card"><div class="who"><div class="av">{esc(ini)}</div><div><p class="n">{esc(name)}</p><p class="s">{m["wip"]} open &middot; {m["completed"]} completed</p></div></div><div class="mgrid">')
         for key, label in METRIC_LABELS:
+            if key == "tickets" and not PEOPLE_TICKETS:
+                continue
             h.append(f'<div title="{esc(METRIC_HELP[key])}"><p class="l">{label}</p><p class="v">{show_metric(key, m)}</p></div>')
         h.append('</div></div>')
     h.append('</div></div></div>')
     return "".join(h)
 
 
-def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m: dict, today: dt.date, mode_label: str = "Discussed only") -> bytes:
+def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m: dict, today: dt.date, mode_label: str = "Discussed only",
+                  people_extra: dict | None = None) -> bytes:
     """Excel workbook: Summary, People, Done this week, Delayed, Due next 7 days, Blocked, No date, Extra tasks."""
     week_ago = today - dt.timedelta(days=7)
     items = items.assign(is_extra=["yes" if x else "" for x in extra_flags(items)])
@@ -1154,7 +1245,8 @@ def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m:
         + [(name, len(df)) for name, df in sheets.items()],
         columns=["Item", "Value"],
     )
-    people = pd.DataFrame([{"Person": n, **{label: show_metric(key, m).replace("&mdash;", "-") for key, label in METRIC_LABELS}} for n, _, m in per])
+    people = pd.DataFrame([{"Person": n, **(people_extra or {}).get(n, {}), **{label: show_metric(key, m).replace("&mdash;", "-") for key, label in METRIC_LABELS
+                                                                          if key != "tickets" or PEOPLE_TICKETS}} for n, _, m in per])
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         summary.to_excel(xw, sheet_name="Summary", index=False)
@@ -1172,189 +1264,416 @@ def weekly_report(items: pd.DataFrame, per: list[tuple[str, str, dict]], team_m:
 
 PEOPLE_CSS = """
 <style>
-.dm .phead,.dm .prow{display:grid;grid-template-columns:190px minmax(0,1fr) 110px 110px 96px;gap:16px;align-items:center}
-.dm .phead{font-size:12px;color:var(--t2);padding:8px 0 6px}
-.dm .prow{padding:11px 0;border-top:0.5px solid var(--b)}
 .dm .pname{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dm .chip{display:inline-flex;gap:4px;align-items:center;font-size:12px;padding:2px 8px;border-radius:8px;margin-top:3px;white-space:nowrap}
 .dm .chip svg{width:13px;height:13px}
 .dm .chip.good{background:#eaf3de;color:#27500a}.dm .chip.watch{background:#faeeda;color:#633806}
 .dm .chip.bad{background:#fcebeb;color:#791f1f}.dm .chip.none{background:var(--s1);color:var(--t2)}
-.dm .stackrow{display:flex;align-items:center;gap:8px}
-.dm .stack{display:flex;height:12px;gap:2px;min-width:2px}
-.dm .stack span{display:block;height:12px;min-width:3px}
-.dm .stack span:first-child{border-radius:2px 0 0 2px}.dm .stack span:last-child{border-radius:0 4px 4px 0}
-.dm .cnt{font-size:12px;color:var(--t2);white-space:nowrap}
-.dm .meter{position:relative;height:8px;background:var(--s1);border-radius:4px;margin-top:4px}
-.dm .meter i{position:absolute;left:0;top:0;height:8px;border-radius:4px}
-.dm .mval{font-size:13px;font-weight:500}.dm .mnone{font-size:12px;color:var(--t3)}
-.dm .drow{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:10px;align-items:center;padding:5px 0;border-top:0.5px solid var(--b)}
-.dm .dtrack{position:relative;height:18px}
-.dm .dzero{position:absolute;left:50%;top:-5px;bottom:-5px;width:1px;background:var(--bs)}
-.dm .dbar{position:absolute;top:4px;height:10px}
-.dm .dlbl{position:absolute;top:1px;font-size:11px;color:var(--t2);white-space:nowrap}
-.dm .daxis{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:10px;font-size:11px;color:var(--t3);margin-top:8px}
-.dm .daxis div{display:flex;justify-content:space-between}
-.dm .why{font-size:13px;color:var(--t2);margin:6px 0 0;padding-left:16px}.dm .why li{margin:2px 0}
 .dm .panel{background:var(--s2);border:0.5px solid var(--b);border-radius:12px;padding:14px 16px;margin-top:8px}
+.dm .pframe{margin-top:36px;padding-top:14px;border-top:0.5px solid var(--bs)}.dm .pframe>.top{margin:0 0 4px}
+.dm .pcard{background:var(--s2);border:0.5px solid var(--b);border-radius:12px;padding:14px 16px 12px;margin-top:12px}
+.dm .pcard>.top{margin:0}.dm .pcard .q{font-size:13px;color:var(--t2);margin:2px 0 0}
+.dm .pcard .lead{font-size:13px;color:var(--t2);margin:10px 0 6px}.dm .pcard .lead b{font-weight:500;color:var(--t1)}
+.dm .crow{display:grid;grid-template-columns:200px minmax(0,1fr) 96px;gap:16px;align-items:center;padding:9px 0;border-top:0.5px solid var(--b)}
+.dm .lrow{display:grid;grid-template-columns:200px minmax(0,1fr) 88px 108px;gap:14px;align-items:center;min-height:36px;padding:9px 0;border-top:0.5px solid var(--b)}
+.dm .pwho{display:flex;gap:10px;align-items:center;min-width:0}.dm .pwho>div:last-child{min-width:0}
+.dm .pav2{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:500;flex:none}
+.dm .s-kept{background:#639922}.dm .s-late{background:#eda100}.dm .s-past{background:#fcebeb;box-shadow:inset 0 0 0 1.5px #e24b4a}
+.dm .s-next{background:#2a78d6}.dm .s-nodate{background:#eb6834}.dm .s-extra{background:#7f77dd}
+.dm .sq{display:flex;flex-wrap:wrap;gap:3px;align-items:center}.dm .sq i{display:block;flex:none;width:14px;height:14px;border-radius:3px}
+.dm .sq i.gap{margin-left:5px}.dm .sq.sm{gap:2px}.dm .sq.sm i{width:10px;height:10px;border-radius:2px}
+.dm .kc{text-align:right;font-size:13px;color:var(--t2);white-space:nowrap;font-variant-numeric:tabular-nums;line-height:1.3}
+.dm .kc b{font-size:18px;font-weight:500;color:var(--t1)}.dm .kc b.dim{color:var(--t3)}.dm .kc small{display:block;font-size:12px;color:var(--t3)}
+.dm .nil{font-size:12px;color:var(--t3)}.dm .pnote{font-size:12px;color:var(--t3);margin-top:6px}
+.dm .lbar{display:flex;gap:2px;height:12px}.dm .lbar i{display:block;height:12px;min-width:4px;border-radius:2px}
+.dm .lbar i.s-extra:not(:first-child){margin-left:4px}.dm .xc{font-size:13px;color:#3c3489;white-space:nowrap}
+.dm .phd{display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:10px}
+.dm .lh{font-size:13px;font-weight:500;margin:18px 0 4px}.dm .lh span{color:var(--t3);font-weight:400}
+.dm .li{display:grid;grid-template-columns:12px minmax(0,1fr) 236px 96px;gap:10px;align-items:center;min-height:34px;border-top:0.5px solid var(--b);font-size:13px}
+.dm .li>i{display:block;width:12px;height:12px;border-radius:3px}
+.dm .li .m{font-size:12px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dm .li .r{font-size:12px;font-weight:500;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.dm .btag{display:inline-block;font-size:11px;line-height:1.5;padding:0 6px;border-radius:6px;background:#fcebeb;color:#791f1f;margin:0 6px 0 0;vertical-align:1px}
+@media (max-width:640px){.dm .crow{grid-template-columns:minmax(0,1fr) auto}.dm .crow>:nth-child(2){grid-column:1/-1;order:3}.dm .lrow{grid-template-columns:minmax(0,1fr) auto auto}.dm .lrow>:nth-child(2){grid-column:1/-1;order:4}.dm .li{grid-template-columns:12px minmax(0,1fr) 96px}.dm .li .m{display:none}}
 </style>
 """
 
-SEGMENTS = [
-    ("done", "Done on time", "#639922"),
-    ("done_late", "Done late", "#eda100"),
-    ("open", "In progress", "#2a78d6"),
-    ("late", "Past due date", "#e24b4a"),
-    ("nodate", "No date yet", "#b4b2a9"),
-]
+VERDICT_MIN = 4        # settled commitments before any label
+GOOD_FROM = 80         # % kept for "Keeps commitments"
+WATCH_FROM = 60        # below this, "Needs support" becomes possible
+BAD_MIN_MISSED = 3     # "Needs support" also needs at least this many not kept
+TEAM_PCT_MIN = 10      # team % shown only from this many settled
+SQ_SMALL_ABOVE = 22    # if anyone has more settled than this, all rows use small squares
+LOAD_SCALE_MIN = 6     # load bar scale floor (2 open items never fill the bar)
+CHIP_RULE = ("A label appears once 4 commitments are settled (delivered, or past the first due date). "
+             "Keeps commitments: 80% or more kept. Needs support: under 60% kept and at least 3 not kept. "
+             "Otherwise: some dates slip.")
 CHIP_ICON = {
     "good": '<svg viewBox="0 0 24 24" fill="none" stroke="#3b6d11" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/></svg>',
     "watch": '<svg viewBox="0 0 24 24" fill="none" stroke="#854f0b" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.5"/></svg>',
     "bad": '<svg viewBox="0 0 24 24" fill="none" stroke="#a32d2d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l10 18H2z"/><path d="M12 10v4M12 17.5v.5"/></svg>',
     "none": '<svg viewBox="0 0 24 24" fill="none" stroke="#898781" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>',
 }
-CHIP_TEXT = {"good": "On track", "watch": "Watch", "bad": "Needs attention", "none": "No data yet"}
 
 
-def verdict(m: dict) -> tuple[str, list[str]]:
-    """Traffic-light reading of one person's metrics, with the reasons in plain words."""
-    if not m["total"]:
-        return "none", ["No deliverables recorded yet."]
-    bad, watch, good = [], [], []
-    if m["delayed_open"]:
-        bad.append(f'{plural(m["delayed_open"], "open deliverable")} past the first due date.')
-    if m["rate"] is not None and m["completed"] >= 2 and m["rate"] < 60:
-        bad.append(f'Only {m["rate"]}% of completed work was on time.')
-    if m["blocked"] >= 2:
-        bad.append(f'{m["blocked"]} deliverables are blocked.')
-    if m["rate"] is not None and 60 <= m["rate"] < 80:
-        watch.append(f'{m["rate"]}% of completed work was on time.')
-    if m["reliability"] is not None and m["reliability"] < 70:
-        watch.append(f'Due dates were moved on {100 - m["reliability"]}% of committed deliverables.')
-    if m["uncommitted"]:
-        watch.append(f'{plural(m["uncommitted"], "deliverable")} without a due date.')
-    if m["blocked"] == 1:
-        watch.append("1 deliverable is blocked.")
-    if m["seg"]["done_late"] and not bad:
-        watch.append(f'{plural(m["seg"]["done_late"], "deliverable")} finished late.')
-    if m["rate"] is not None and m["rate"] >= 80:
-        good.append(f'{m["rate"]}% of completed work was on time.')
-    if m["seg"]["open"]:
-        good.append(f'{plural(m["seg"]["open"], "deliverable")} in progress and inside the due date.')
-    if m["reliability"] is not None and m["reliability"] >= 90 and m["committed"]:
-        good.append("Due dates were kept as first promised.")
-    if bad:
-        return "bad", bad + watch
-    if watch:
-        return "watch", watch + good
-    return "good", good or ["Nothing late, nothing blocked."]
-
-
-def chip(kind: str) -> str:
-    return f'<span class="chip {kind}">{CHIP_ICON[kind]}{CHIP_TEXT[kind]}</span>'
-
-
-def meter(value, good_from: int = 80, watch_from: int = 60, none_text: str = "no closures yet") -> str:
-    if value is None:
-        return f'<span class="mnone">{none_text}</span>'
-    color = "#639922" if value >= good_from else ("#eda100" if value >= watch_from else "#e24b4a")
-    return f'<span class="mval">{value}%</span><div class="meter"><i style="width:{max(value, 2)}%;background:{color}"></i></div>'
-
-
-def stacked(m: dict, scale: int) -> str:
-    total = sum(m["seg"].values())
-    if not total:
-        return '<span class="mnone">no deliverables</span>'
-    h = [f'<div class="stackrow"><div class="stack" style="width:{round(88 * total / max(scale, 1), 1)}%">']
-    for key, label, color in SEGMENTS:
-        n = m["seg"][key]
-        if n:
-            h.append(f'<span title="{label}: {n}" style="flex:{n} 1 0;background:{color}"></span>')
-    h.append(f'</div><span class="cnt">{total}</span></div>')
-    return "".join(h)
-
-
-def legend_segments() -> str:
-    return '<div class="legend" style="flex-wrap:wrap">' + "".join(
-        f'<span><span class="sw" style="background:{c}"></span>{label.lower()}</span>' for _, label, c in SEGMENTS) + '</div>'
-
-
-def render_people_overview(per: list[tuple[str, str, dict]]) -> str:
-    scale = max([sum(m["seg"].values()) for _, _, m in per] + [1])
-    xscale = max([m.get("extras", 0) for _, _, m in per] + [1])
-    h = ['<div class="dm"><div class="block"><div class="top" style="margin-bottom:0"><span class="h2">People at a glance</span><span class="muted">bar length = number of deliverables</span></div>']
-    h.append('<div class="phead"><span>Person</span><span>Deliverables by state</span><span title="Completed on or before the due date">On time</span><span title="Due date never moved after the first promise">Kept their date</span><span title="Tasks added after the stand-up">Extras</span></div>')
-    for idx, (name, ini, m) in enumerate(per):
-        kind, _ = verdict(m)
-        h.append('<div class="prow">')
-        h.append(f'<div style="display:flex;gap:10px;align-items:center"><div class="av" style="width:34px;height:34px;font-size:12px;background:{person_color(idx)[1]};color:#fff">{esc(ini)}</div><div style="min-width:0"><p class="pname" title="{esc(name)}">{esc(name)}</p>{chip(kind)}</div></div>')
-        h.append(f'<div>{stacked(m, scale)}</div>')
-        h.append(f'<div>{meter(m["rate"])}</div>')
-        h.append(f'<div>{meter(m["reliability"], 90, 70, "no dates yet")}</div>')
-        h.append(f'<div>{extras_cell(m, xscale)}</div>')
-        h.append('</div>')
-    h.append('<div class="end"></div>' + legend_segments().replace('</div>', '<span><span class="sw" style="background:#7f77dd"></span>extra tasks</span></div>') + '</div></div>')
-    return "".join(h)
-
-
-def schedule_rows(df: pd.DataFrame, today: dt.date) -> list[dict]:
-    """Days against the due date for every dated deliverable: negative = ahead, positive = late."""
-    rows = []
-    for _, r in df.iterrows():
-        due = first_due(r.get("due_original"), r.get("due_current"))
-        if r["status"] == "Cancelled" or not is_date(due):
-            continue
-        if r["status"] == "Done" and is_date(r["completed_on"]):
-            n = (r["completed_on"] - due).days
-            kind = "done_late" if n > 0 else "done"
-            text_ = f"{plural(n, 'day')} late" if n > 0 else ("on the day" if n == 0 else f"{plural(-n, 'day')} early")
-        else:
-            n = (today - due).days
-            kind = "late" if n > 0 else "open"
-            text_ = f"{plural(n, 'day')} past due" if n > 0 else ("due today" if n == 0 else f"due in {plural(-n, 'day')}")
-        rows.append({"title": r["deliverable"], "n": n, "kind": kind, "text": text_, "status": r["status"]})
-    return sorted(rows, key=lambda x: -x["n"])
-
-
-def render_person_detail(name: str, ini: str, m: dict, df: pd.DataFrame, today: dt.date) -> str:
-    kind, reasons = verdict(m)
-    colors = {k: c for k, _, c in SEGMENTS}
-    h = ['<div class="dm"><div class="panel">']
-    h.append(f'<div style="display:flex;gap:12px;align-items:center"><div class="av" style="width:40px;height:40px;font-size:14px">{esc(ini)}</div><div><p class="pname" style="font-size:16px">{esc(name)}</p>{chip(kind)}</div></div>')
-    h.append('<ul class="why">' + "".join(f"<li>{esc(x)}</li>" for x in reasons) + '</ul>')
-
-    h.append('<div class="kpis" style="margin-top:14px">')
-    h.append(f'<div class="kpi"><p class="l">Deliverables</p><div style="margin-top:6px">{stacked(m, sum(m["seg"].values()))}</div><p class="d">{m["wip"]} open &middot; {m["completed"]} completed</p></div>')
-    h.append(f'<div class="kpi"><p class="l">On time</p><div style="margin-top:2px">{meter(m["rate"])}</div><p class="d">{m["on_time"]} of {m["completed"]} completed</p></div>')
-    h.append(f'<div class="kpi"><p class="l">Kept their date</p><div style="margin-top:2px">{meter(m["reliability"], 90, 70, "no dates yet")}</div><p class="d">{m["committed"]} committed</p></div>')
-    h.append(f'<div class="kpi"><p class="l">Open tickets</p><p class="v">{m["tickets"]}</p><p class="d">{m["blocked"]} blocked deliverable{"" if m["blocked"] == 1 else "s"}</p></div>')
-    h.append(f'<div class="kpi"><p class="l">Extra tasks</p><p class="v">{m["extras"]}</p><p class="d">{m["extras_done"]} done &middot; {m["extras_open"]} open</p></div>')
-    h.append('</div>')
-
-    rows = schedule_rows(df, today)
-    h.append('<div class="top" style="margin:18px 0 0"><span class="h2">Against the first due date</span><span class="muted">left = ahead of the date &middot; right = late</span></div>')
-    if not rows:
-        h.append('<p class="sec" style="margin-top:8px">No deliverables with a due date yet.</p>')
-    else:
-        span = max(max(abs(r["n"]) for r in rows), 7)
-        h.append(f'<div class="daxis"><span></span><div><span>{span} days ahead</span><span>first due date</span><span>{span} days late</span></div></div>')
-        for r in rows:
-            w = round(50 * abs(r["n"]) / span, 2)
-            h.append(f'<div class="drow"><span class="t" title="{esc(r["title"])} &middot; {esc(r["status"])}">{esc(r["title"])}</span><div class="dtrack"><div class="dzero"></div>')
-            if r["n"] > 0:
-                h.append(f'<div class="dbar" style="left:50%;width:{max(w, 0.8)}%;background:{colors[r["kind"]]};border-radius:0 4px 4px 0"></div>')
-                pos = f'left:{min(50 + w + 1.5, 78)}%' if w < 30 else f'right:{50 + 1.5}%'
+def classify(df: pd.DataFrame, today: dt.date) -> pd.DataFrame:
+    """Non-cancelled rows with base (first due date), extra flag, outcome, days and moved."""
+    c = where(df, df["status"] != "Cancelled").copy()
+    c["base"] = [first_due(o, d) for o, d in zip(c["due_original"], c["due_current"])]
+    c["extra"] = extra_flags(c)
+    outcome, days = [], []
+    for s, b, done_on in zip(c["status"], c["base"], c["completed_on"]):
+        if s == "Done":
+            if not is_date(done_on):
+                o, n = "unscored", None            # Done without a completion date
+            elif not is_date(b):
+                o, n = "done_undated", None        # delivered, never had a date
             else:
-                h.append(f'<div class="dbar" style="right:50%;width:{max(w, 0.8)}%;background:{colors[r["kind"]]};border-radius:4px 0 0 4px"></div>')
-                pos = f'left:{50 + 1.5}%'
-            h.append(f'<span class="dlbl" style="{pos}">{esc(r["text"])}</span></div></div>')
-        h.append('<div class="end"></div>')
-        h.append('<div class="legend" style="flex-wrap:wrap">' + "".join(
-            f'<span><span class="sw" style="background:{c}"></span>{label.lower()}</span>' for k, label, c in SEGMENTS if k != "nodate") + '</div>')
-    if m["uncommitted"]:
-        h.append(f'<p class="sec" style="margin-top:8px">{plural(m["uncommitted"], "deliverable")} without a due date {"is" if m["uncommitted"] == 1 else "are"} not on this chart.</p>')
+                n = (done_on - b).days             # <= 0 early or on the day, > 0 late
+                o = "late" if n > 0 else "kept"
+        elif s in OPEN_STATUSES:
+            if not is_date(b):
+                o, n = "nodate", None
+            elif b < today:
+                o, n = "overdue", (today - b).days
+            else:
+                o, n = "upcoming", (b - today).days  # due today counts as upcoming
+        else:
+            o, n = "other", None
+        outcome.append(o)
+        days.append(n)
+    c["outcome"] = outcome
+    c["days"] = pd.Series(days, index=c.index, dtype=object)
+    c["moved"] = [is_date(o) and is_date(d) and o != d for o, d in zip(c["due_original"], c["due_current"])]
+    return c
+
+
+def commit_stats(c: pd.DataFrame) -> dict:
+    rows = [r for _, r in c.iterrows()]
+
+    def pick(k):
+        return sorted([r for r in rows if r["outcome"] == k], key=lambda r: (r["base"], str(r["deliverable"])))
+
+    kept, late, over = pick("kept"), pick("late"), pick("overdue")
+    return {
+        "kept": len(kept), "late": len(late), "overdue": len(over),
+        "settled": len(kept) + len(late) + len(over), "missed": len(late) + len(over),
+        "avg_late": avg([r["days"] for r in late + over]),
+        "squares": [("s-kept", r) for r in kept] + [("s-late", r) for r in late] + [("s-past", r) for r in over],
+        "delivered": sorted(kept + late, key=lambda r: r["completed_on"], reverse=True),
+        "unscored": sum(r["outcome"] == "unscored" for r in rows),
+        "done_undated": sum(r["outcome"] == "done_undated" for r in rows),
+        "committed": sum(is_date(r["base"]) for r in rows),
+        "moved": sum(bool(r["moved"]) for r in rows),
+    }
+
+
+def load_stats(c: pd.DataFrame) -> dict:
+    """The whole plate: every open row, discussed and extra, whatever the Measure switch says."""
+    op = where(c, c["outcome"].isin(["overdue", "nodate", "upcoming"]))
+    k = [o for o, x in zip(op["outcome"], op["extra"]) if not x]
+    planned = float(pd.to_numeric(op["planned_days"], errors="coerce").fillna(0).sum()) if len(op) and "planned_days" in op.columns else 0.0
+    return {
+        "past": k.count("overdue"), "needs_date": k.count("nodate"), "on_schedule": k.count("upcoming"),
+        "extras_open": sum(bool(x) for x in op["extra"]), "open_total": len(op),
+        "blocked": sum(s == "Blocked" for s in op["status"]), "planned": round(planned, 1),
+        "extras_done": sum(bool(x) and s == "Done" for x, s in zip(c["extra"], c["status"])),
+        "extras_taken": sum(bool(x) for x in c["extra"]),
+    }
+
+
+def commit_verdict(kept: int, settled: int) -> tuple[str, str]:
+    if settled == 0:
+        return "none", "No results yet"
+    if settled < VERDICT_MIN:
+        return "none", "Too early to tell"
+    if kept * 100 >= GOOD_FROM * settled:
+        return "good", "Keeps commitments"
+    if kept * 100 >= WATCH_FROM * settled or settled - kept < BAD_MIN_MISSED:
+        return "watch", "Some dates slip"
+    return "bad", "Needs support"
+
+
+def chip(kind: str, label: str, tip: str | None = None) -> str:
+    return f'<span class="chip {kind}" title="{esc(CHIP_RULE if tip is None else tip)}">{CHIP_ICON[kind]}{esc(label)}</span>'
+
+
+def outcome_text(r) -> str:
+    """Tooltip for one deliverable, escaped."""
+    o, n = r["outcome"], r["days"]
+    if o == "kept":
+        what = "kept, done on the day" if n == 0 else f"kept, done {plural(-int(n), 'day')} early"
+    elif o == "late":
+        what = f"delivered {plural(int(n), 'day')} late"
+    elif o == "overdue":
+        what = f"still open, {plural(int(n), 'day')} past the first due date"
+    elif o == "upcoming":
+        what = "due today" if n == 0 else f"due in {plural(int(n), 'day')}"
+    else:
+        what = "no due date yet"
+    parts = [esc(r["deliverable"]), what]
+    if is_date(r["base"]):
+        parts.append(f"first due {fmt(r['base'])}")
+    if bool(r["moved"]):
+        parts.append(f"date moved to {fmt(r['due_current'])}")
+    if r["status"] == "Blocked":
+        parts.append("blocked")
+    if bool(r["extra"]):
+        parts.append("extra task")
+    return " &middot; ".join(parts)
+
+
+def pav(p: dict) -> str:
+    tint, _, ink = person_color(p["idx"])
+    return f'<div class="pav2" style="background:{tint};color:{ink}">{esc(p["ini"])}</div>'
+
+
+def _is_are(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
+
+
+def render_commitments(people: list[dict], mode_label: str) -> str:
+    K = sum(p["s"]["kept"] for p in people)
+    S = sum(p["s"]["settled"] for p in people)
+    O = sum(p["s"]["overdue"] for p in people)
+    U = sum(p["s"]["unscored"] for p in people)
+    small = any(p["s"]["settled"] > SQ_SMALL_ABOVE for p in people)
+    h = ['<div class="pcard">']
+    h.append(f'<div class="top"><span class="h2">Keeping commitments</span><span class="muted">{esc(mode_label.lower())} &middot; counted from the first due date</span></div>')
+    h.append('<p class="q">Do they deliver by the first promised date? One square = one commitment.</p>')
+    if S:
+        pct = f" ({int(100 * K / S + 0.5)}%)" if S >= TEAM_PCT_MIN else ""
+        tail = (f'<b>{O}</b> {_is_are(O, "is", "are")} still open past the first due date.' if O
+                else "Nothing is open past its first due date.")
+        h.append(f'<p class="lead">Together the team kept <b>{K} of {S}</b> {"commitment" if S == 1 else "commitments"}{pct}. {tail}</p>')
+    elif mode_label == "Extras only":
+        h.append('<p class="lead">No extra tasks have been delivered or come due yet.</p>')
+    else:
+        h.append('<p class="lead">Nothing has been delivered or come due yet. Results appear as work is delivered or first due dates pass.</p>')
+    for p in people:
+        s = p["s"]
+        h.append('<div class="crow">')
+        h.append(f'<div class="pwho">{pav(p)}<div><p class="pname" title="{esc(p["name"])}">{esc(p["name"])}</p>{chip(p["kind"], p["label"])}</div></div>')
+        if s["settled"]:
+            sq = []
+            gap_done = False
+            for cls, r in s["squares"]:
+                gap = ""
+                if cls != "s-kept" and not gap_done:
+                    gap_done = True
+                    gap = " gap" if s["kept"] else ""
+                sq.append(f'<i class="{cls}{gap}" title="{outcome_text(r)}"></i>')
+            h.append(f'<div class="sq{" sm" if small else ""}">{"".join(sq)}</div>')
+            tip = " &middot; ".join(x for x in [
+                f'{s["kept"]} kept' if s["kept"] else "",
+                f'{s["late"]} delivered late' if s["late"] else "",
+                f'{s["overdue"]} still open past the first due date' if s["overdue"] else "",
+            ] if x)
+            miss = f'<small>{s["missed"]} not kept</small>' if s["missed"] else ""
+            h.append(f'<div class="kc" title="{tip}"><b>{s["kept"]}</b> of {s["settled"]} kept{miss}</div>')
+        else:
+            h.append('<span class="nil">Nothing due or delivered yet</span>')
+            h.append('<div class="kc"><b class="dim">&mdash;</b></div>')
+        h.append('</div>')
+    h.append('<div class="end"></div>')
+    h.append('<div class="legend" style="flex-wrap:wrap">'
+             '<span><span class="sw s-kept"></span>kept: delivered by the first due date</span>'
+             '<span><span class="sw s-late"></span>delivered late</span>'
+             '<span><span class="sw s-past"></span>still open past the first due date</span></div>')
+    note = f"Labels appear once {VERDICT_MIN} commitments are settled. Work not yet due is not scored; it is on the plate below."
+    if U:
+        note += f' {U} {_is_are(U, "item is", "items are")} marked Done without a completion date and not counted.'
+    h.append(f'<p class="pnote">{note}</p>')
+    h.append('</div>')
+    return "".join(h)
+
+
+def render_load(people: list[dict]) -> str:
+    opn = sum(p["L"]["open_total"] for p in people)
+    N = sum(p["L"]["needs_date"] for p in people)
+    X = sum(p["L"]["extras_open"] for p in people)
+    scale = max([LOAD_SCALE_MIN] + [p["L"]["open_total"] for p in people])
+    h = ['<div class="pcard">']
+    h.append('<div class="top"><span class="h2">On their plate</span><span class="muted">open now &middot; all work, extras included</span></div>')
+    h.append('<p class="q">How much open work does each person carry? The Measure switch does not change this card.</p>')
+    if opn:
+        lead = f"<b>{opn}</b> open across the team"
+        if N:
+            lead += f' &middot; <b>{N}</b> {"needs" if N == 1 else "need"} a date'
+        if X:
+            lead += f' &middot; <b>{X}</b> extra {"task" if X == 1 else "tasks"} open'
+        h.append(f'<p class="lead">{lead}</p>')
+    else:
+        h.append('<p class="lead">Nobody has open work right now.</p>')
+    segs_def = [("past", "s-past", "past the first due date"), ("needs_date", "s-nodate", None),
+                ("on_schedule", "s-next", "on schedule"), ("extras_open", "s-extra", None)]
+    for p in people:
+        L = p["L"]
+        h.append('<div class="lrow">')
+        h.append(f'<div class="pwho">{pav(p)}<div><p class="pname" title="{esc(p["name"])}">{esc(p["name"])}</p></div></div>')
+        if L["open_total"]:
+            segs = []
+            for key, cls, label in segs_def:
+                n = L[key]
+                if not n:
+                    continue
+                if key == "needs_date":
+                    label = "needs a date" if n == 1 else "need a date"
+                if key == "extras_open":
+                    label = "extra task" if n == 1 else "extra tasks"
+                segs.append(f'<i class="{cls}" style="flex:{n} 1 0" title="{n} {label}"></i>')
+            h.append(f'<div><div class="lbar" style="width:{round(100 * L["open_total"] / scale, 1)}%">{"".join(segs)}</div></div>')
+        else:
+            h.append('<span class="nil">Nothing open</span>')
+        tip = " &middot; ".join(x for x in [
+            f'{L["past"]} past the first due date' if L["past"] else "",
+            f'{L["needs_date"]} {"needs" if L["needs_date"] == 1 else "need"} a date' if L["needs_date"] else "",
+            f'{L["on_schedule"]} on schedule' if L["on_schedule"] else "",
+            f'{L["extras_open"]} extra open' if L["extras_open"] else "",
+            f'{L["blocked"]} blocked' if L["blocked"] else "",
+        ] if x)
+        planned = f'<small>{L["planned"]:g} d planned</small>' if L["planned"] else ""
+        num = f'<b>{L["open_total"]}</b>' if L["open_total"] else '<b class="dim">0</b>'
+        h.append(f'<div class="kc" title="{tip}">{num} open{planned}</div>')
+        if L["extras_done"]:
+            n = L["extras_done"]
+            h.append(f'<div class="xc" title="Tasks added after the stand-up that {esc(p["name"])} finished. Open ones are purple in the bar.">{n} {"extra" if n == 1 else "extras"} done</div>')
+        else:
+            h.append('<div></div>')
+        h.append('</div>')
+    h.append('<div class="end"></div>')
+    h.append('<div class="legend" style="flex-wrap:wrap">'
+             '<span><span class="sw s-past"></span>past the first due date</span>'
+             '<span><span class="sw s-nodate"></span>needs a date</span>'
+             '<span><span class="sw s-next"></span>on schedule</span>'
+             '<span><span class="sw s-extra"></span>extra task</span></div>')
+    h.append('<p class="pnote">Bar length = open items, same scale for everyone.</p>')
+    h.append('</div>')
+    return "".join(h)
+
+
+def render_people(people: list[dict], mode_label: str) -> str:
+    h = ['<div class="dm"><div class="pframe"><div class="top"><span class="h1">People</span><span class="muted">only you can see this section</span></div>']
+    if not people:
+        h.append('<p class="sec">No active people in the team yet.</p>')
+    else:
+        h.append(render_commitments(people, mode_label))
+        h.append(render_load(people))
     h.append('</div></div>')
     return "".join(h)
+
+
+def _li(marker: str, r, meta: str, right: str, ink: str) -> str:
+    tags = ""
+    if bool(r["extra"]):
+        tags += '<span class="xtag" style="margin:0 6px 0 0">extra</span>'
+    if r["status"] == "Blocked":
+        tags += '<span class="btag">blocked</span>'
+    title = esc(r["deliverable"])
+    return (f'<div class="li"><i class="{marker}"></i><span class="t" title="{title}">{tags}{title}</span>'
+            f'<span class="m" title="{meta}">{meta}</span><span class="r" style="color:{ink}">{right}</span></div>')
+
+
+def _list_block(title: str, lines: list[str], keep: int, more_word: str) -> str:
+    h = [f'<p class="lh">{title} <span>&middot; {len(lines)}</span></p>']
+    h.extend(lines[:keep])
+    if len(lines) > keep:
+        h.append(f'<details class="dl"><summary class="sec">Show {len(lines) - keep} {more_word}</summary>{"".join(lines[keep:])}</details>')
+    return "".join(h)
+
+
+def render_person_detail(p: dict, today: dt.date) -> str:
+    tint, fill, ink = person_color(p["idx"])
+    s, L, c_all = p["s"], p["L"], p["c_all"]
+    h = ['<div class="dm"><div class="panel">']
+    h.append(f'<div class="phd" style="background:{tint}"><div class="pav" style="background:{fill};width:36px;height:36px">{esc(p["ini"])}</div>'
+             f'<div class="pnm" style="color:{ink}" title="{esc(p["name"])}">{esc(p["name"])}</div>{chip(p["kind"], p["label"])}</div>')
+    if not len(c_all):
+        h.append(f'<p class="sec" style="margin-top:10px">No deliverables recorded for {esc(p["name"])} yet.</p></div></div>')
+        return "".join(h)
+
+    if s["settled"]:
+        summ = f'Kept {s["kept"]} of {plural(s["settled"], "commitment")} by the first due date.'
+        if s["missed"] and s["avg_late"] is not None:
+            d = s["avg_late"]
+            days_txt = f'{d:g} {"day" if d == 1 else "days"}'
+            if s["missed"] == 1:
+                summ += f" The one not kept was {days_txt} past the first due date."
+            else:
+                summ += f" Those not kept average {days_txt} past the first due date."
+        if s["settled"] < VERDICT_MIN:
+            summ += f" Too few to judge yet; a label appears after {VERDICT_MIN}."
+    else:
+        summ = "Nothing delivered or due yet."
+    h.append(f'<p class="sec" style="margin:10px 0 12px">{summ}</p>')
+
+    n_past = sum(o == "overdue" for o in c_all["outcome"])   # all open work, extras included,
+    n_nod = sum(o == "nodate" for o in c_all["outcome"])     # so the tile matches Needs attention
+    open_parts = [x for x in [
+        f'{n_past} past first due date' if n_past else "",
+        f'{n_nod} {"needs" if n_nod == 1 else "need"} a date' if n_nod else "",
+        f'{L["blocked"]} blocked' if L["blocked"] else "",
+    ] if x]
+    open_d = " &middot; ".join(open_parts) if open_parts else ("all on schedule" if L["open_total"] else "nothing open")
+    kept_v = f'{s["kept"]} of {s["settled"]}' if s["settled"] else "&mdash;"
+    extra_d = f'{L["extras_done"]} done &middot; {L["extras_open"]} open' if L["extras_taken"] else "none yet"
+    h.append('<div class="kpis">'
+             f'<div class="kpi"><p class="l">Commitments kept</p><p class="v">{kept_v}</p><p class="d">by the first due date</p></div>'
+             f'<div class="kpi"><p class="l">Open now</p><p class="v">{L["open_total"]}</p><p class="d">{open_d}</p></div>'
+             f'<div class="kpi"><p class="l">Extras taken on</p><p class="v">{L["extras_taken"]}</p><p class="d">{extra_d}</p></div>'
+             '</div>')
+
+    rows = [r for _, r in c_all.iterrows()]
+    over = sorted([r for r in rows if r["outcome"] == "overdue"], key=lambda r: -int(r["days"]))
+    nod = sorted([r for r in rows if r["outcome"] == "nodate"],
+                 key=lambda r: (not is_date(r["discussed_on"]), r["discussed_on"] if is_date(r["discussed_on"]) else dt.date.max))
+    upc = sorted([r for r in rows if r["outcome"] == "upcoming"], key=lambda r: (r["base"], str(r["deliverable"])))
+
+    def moved_txt(r):
+        return f' &middot; now {fmt(r["due_current"])}' if bool(r["moved"]) else ""
+
+    attention = [_li("s-past", r, f'first due {fmt(r["base"])}{moved_txt(r)}', f'{plural(int(r["days"]), "day")} past', "#a32d2d") for r in over]
+    attention += [_li("s-nodate", r, f'discussed {fmt(r["discussed_on"])}' if is_date(r["discussed_on"]) else "", "needs a date", "#712b13") for r in nod]
+    coming = [_li("s-next", r, f'due {fmt(r["base"])}{moved_txt(r)}',
+                  "today" if r["days"] == 0 else f'in {plural(int(r["days"]), "day")}', "var(--t2)") for r in upc]
+    if attention:
+        h.append(_list_block("Needs attention", attention, len(attention), "more"))
+    if coming:
+        h.append(_list_block("Coming up", coming, 8, "more"))
+    if not attention and not coming:
+        h.append('<p class="sec" style="margin-top:12px">Nothing open right now.</p>')
+
+    delivered = []
+    for r in s["delivered"]:
+        n = int(r["days"])
+        right, col = (("on the day" if n == 0 else f"{plural(-n, 'day')} early"), "#3b6d11") if n <= 0 else (f"{plural(n, 'day')} late", "#854f0b")
+        delivered.append(_li("s-kept" if n <= 0 else "s-late", r, f'first due {fmt(r["base"])} &middot; done {fmt(r["completed_on"])}', right, col))
+    if delivered:
+        h.append(_list_block("Delivered", delivered, 6, "earlier"))
+    else:
+        h.append('<p class="lh">Delivered <span>&middot; 0</span></p><p class="sec" style="margin-top:6px">Nothing delivered against a date yet.</p>')
+
+    notes = []
+    if s["moved"]:
+        notes.append(f'Due date moved on {s["moved"]} of {s["committed"]}; lateness still counts from the first date.')
+    if s["unscored"]:
+        notes.append(f'{s["unscored"]} marked Done without a completion date {_is_are(s["unscored"], "is", "are")} not counted.')
+    if s["done_undated"]:
+        notes.append(f'{s["done_undated"]} delivered without a due date {_is_are(s["done_undated"], "is", "are")} not scored.')
+    h.extend(f'<p class="pnote">{x}</p>' for x in notes)
+    h.append('</div></div>')
+    return "".join(h)
+
+
+def build_people(mode: str, mode_label: str) -> list[dict]:
+    people = []
+    for idx, (n, ini) in enumerate(zip(team["name"], team["initials"])):
+        c_all = classify(where(items, items["owner"] == n), today)
+        s = commit_stats(by_mode(c_all, mode))
+        kind, label = commit_verdict(s["kept"], s["settled"])
+        people.append({"idx": idx, "name": n, "ini": str(ini), "s": s, "L": load_stats(c_all),
+                       "kind": kind, "label": label, "c_all": c_all, "mode_label": mode_label})
+    return people
 
 
 def metrics_tab() -> None:
@@ -1375,25 +1694,429 @@ def metrics_tab() -> None:
     if not st.session_state.get("is_admin"):
         st.info("Per-person metrics and the weekly report are shown after signing in as manager on the Manage tab.")
         return
-    st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_people_overview(per), unsafe_allow_html=True)
-    who = st.selectbox("Look at one person", [n for n, _, _ in per], key="m_person")
-    for n, ini, m in per:
-        if n == who:
-            st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(n, ini, m, by_mode(where(items, items["owner"] == n), mode), today), unsafe_allow_html=True)
+    people = build_people(mode, mode_label)
+    st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_people(people, mode_label), unsafe_allow_html=True)
+    if people:
+        if st.session_state.get("m_person") is not None and st.session_state["m_person"] not in names:
+            del st.session_state["m_person"]
+        who = st.selectbox("Look at one person", names, index=None, placeholder="Choose a person", key="m_person")
+        for p in people:
+            if p["name"] == who:
+                st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(p, today), unsafe_allow_html=True)
     with st.expander("All numbers per person"):
         st.markdown(CSS + METRIC_CSS + render_person_cards(per), unsafe_allow_html=True)
+    people_extra = {p["name"]: {"Commitments kept": f'{p["s"]["kept"]} of {p["s"]["settled"]}' if p["s"]["settled"] else "-",
+                                "Label": p["label"]} for p in people}
     st.download_button(
-        "Download weekly report (Excel)", weekly_report(items, per, team_m, today, mode_label),
+        "Download weekly report (Excel)", weekly_report(items, per, team_m, today, mode_label, people_extra),
         file_name=f"Weekly report {today:%Y-%m-%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="m_report",
     )
 
 
 # ----------------------------------------------------------------------------
+# Ticket health tab: KPIs from the synced Jira history (ticket_kpis.py, spec v1)
+# ----------------------------------------------------------------------------
+HEALTH_CSS = """
+<style>
+.dm .hbar{display:flex;gap:2px;height:16px;margin-top:8px}.dm .hbar i{display:block;min-width:3px}
+.dm .hbar i:first-child{border-radius:3px 0 0 3px}.dm .hbar i:last-child{border-radius:0 3px 3px 0}.dm .hbar i:only-child{border-radius:3px}
+.dm .hleg{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--t2);margin-top:8px}.dm .hleg b{font-weight:500;color:var(--t1)}
+.dm .hline{font-size:12px;color:var(--t2);margin-top:6px;line-height:1.5}
+.dm .kpi .y{font-size:12px;color:var(--t2);margin-top:6px}.dm .kpi .chip{margin-top:6px}
+.dm .s-wait{background:var(--s1);box-shadow:inset 0 0 0 1.5px #b4b2a9}.dm .s-held{background:#639922}.dm .s-back{background:#eda100}
+.dm .s-in{background:#2a78d6}.dm .s-slow{background:#eda100}
+.dm .trends{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-top:8px}
+.dm .tr .l{font-size:12px;color:var(--t2);margin-bottom:4px}
+.dm .mt{position:relative;display:flex;gap:3px;align-items:flex-end;height:44px;border-bottom:0.5px solid var(--b)}
+.dm .mt i{display:block;flex:1;background:#2a78d6;border-radius:2px 2px 0 0;min-height:2px}
+.dm .mt i.so{opacity:.45}.dm .mt i.thin{background:none;box-shadow:inset 0 0 0 1px #2a78d6}
+.dm .mt .base{position:absolute;left:0;right:0;border-top:1px dashed #898781}
+.dm .mtl{display:flex;gap:3px;font-size:10px;color:var(--t3);margin-top:2px}.dm .mtl span{flex:1;text-align:center}
+.dm .li a{color:#185fa5;text-decoration:none}.dm .li .tg{display:inline-block;font-size:11px;line-height:1.5;padding:0 6px;border-radius:6px;background:#faeeda;color:#633806;margin-right:6px}
+@media (max-width:640px){.dm .trends{grid-template-columns:1fr}}
+</style>
+"""
+HEALTH_HELP = """
+**How these are measured.** Everything comes from the Jira history, read-only. Business hours are Monday to Friday, 09:00 to 18:00 Rome time, minus the holidays table.
+
+- **Answered in time.** Jira's own *Time to first response* timer, first cycle, for tickets created in the month whose first assignee was on the team. This is a team-level number only, because the first reply is a shared inbox duty.
+- **Stayed fixed.** One square per ticket, at its first delivery into *Client Feedback* or *Closed*.
+  - *Came back* means it went back to an open status within 30 days.
+  - Going back and being re-delivered within 4 business hours, only through Open, Under Review or Inbox, is a quick follow-up and does not count.
+  - *Held* means 30 days passed, or the ticket reached Closed, without coming back.
+  - It is credited to the ticket's main owner, the team member who held it longest on our side.
+- **Time on our side.** Business hours in *Open* or *Under Review* with a team member assigned, from creation to first delivery. Waiting for the client, the bank, a release, another team or triage is never counted.
+  - *Within usual* compares that time with the team's level in the baseline year (the previous calendar year, 2025 at the start) for the same ticket type (80th percentile).
+- **Where the time goes.** The same business hours, split by whose side the ball was on. The side of each status comes from the `jira_status_map` table.
+- **Whose move is it?** Open tickets right now. "Open" means the current status is not a delivered one.
+- **Could use a nudge.** Open tickets with no team comment or change:
+  - on our side: 0.5 business days (Critical), 1 (High) or 3 (Medium/Low);
+  - triage: 1 day;
+  - client: 5 days without a public update;
+  - bank: 5 days;
+  - release: 15 days.
+- **Person labels (manager only).** A person gets a label only from 10 settled tickets, and is compared only with what the team's 2025 results predict for the same mix of ticket types, never with colleagues. A label is a reason to look at the tickets together, not a judgement.
+
+Jira's *Time to resolution* timer is not used, because in this project it keeps running after tickets close.
+"""
+
+
+HEALTH_PERSON_TIP = ("A label appears from 10 settled tickets. Compared only with what the team's baseline-year results "
+                     "predict for the same mix of ticket types. Amber means worth a look together, never a judgement.")
+
+
+def _months_menu(today: dt.date, first_year: int = 2025) -> list[pd.Period]:
+    cur = pd.Timestamp(today).to_period("M")
+    return list(pd.period_range(f"{first_year}-01", cur, freq="M"))[::-1]
+
+
+def _month_label(m: pd.Period, today: dt.date) -> str:
+    return m.strftime("%B %Y") + (" (so far)" if m == pd.Timestamp(today).to_period("M") else "")
+
+
+@st.cache_resource(ttl=3600, show_spinner="Working out ticket health from the Jira history...")
+def health_model(sync_key: str) -> dict | None:
+    """Rebuilt once per sync (sync_key changes when new data arrives). Returns None before the Jira tables exist."""
+    try:
+        tks = query("""select ticket_id, jira_key, summary, issue_type, priority, jira_status, resolution, created_at,
+                              assignee_id, assignee_name from tickets where jira_key is not null""")
+        events = query("""select ticket_id, history_id, item_no, at, author_type, field, from_value, to_value, from_user_id, to_user_id
+                          from jira_events where field in ('status', 'assignee')""")
+        comments = query("select ticket_id, created_at, author_type, is_public from jira_comments where author_type = 'team'")
+        sla = query("select ticket_id, cycle, ongoing, breached, goal_ms, elapsed_ms from jira_sla where sla = 'first_response'")
+        smap = query("select * from jira_status_map")
+        people = query("select user_id, full_name, initials from users where jira_account_id is not null order by user_id")
+    except Exception as e:  # noqa: BLE001
+        msg = str(e).lower()
+        if "does not exist" in msg or "no such table" in msg or "no such column" in msg or "undefined" in msg:
+            return None          # the Jira tables are not there yet
+        raise                    # anything else: not cached, shown to the user, retried next time
+    if tks.empty:
+        return None
+    try:
+        hol = query("select day from holidays")
+        KPI.HOLIDAYS = {pd.Timestamp(d).date() for d in hol["day"]}
+    except Exception:  # noqa: BLE001 - holidays table is optional
+        pass
+    try:
+        rep = query("select ticket_id, reporter_type from tickets where jira_key is not null and reporter_type is not null")
+        reporter = {int(r.ticket_id): str(r.reporter_type) for r in rep.itertuples()}
+    except Exception:  # noqa: BLE001 - reporter_type arrives with the next sync
+        reporter = {}
+    side_map = {str(r.status): str(r.side) for r in smap.itertuples()}
+    delivered = ({str(r.status) for r in smap.itertuples() if bool(getattr(r, "delivered", False))}
+                 if "delivered" in smap.columns else set()) or KPI.DEFAULT_DELIVERED
+    team_ids = {int(x) for x in people["user_id"]}
+    now = pd.Timestamp(sync_key).tz_convert("UTC").to_pydatetime()   # "now" = the last sync, as the spec defines
+    tk = KPI.build(tks, events, comments, side_map, delivered, team_ids, now)
+    fd = KPI.first_deliveries(tk)
+    this_year = now.astimezone(KPI.WORK_TZ).year
+    base = KPI.baseline(fd, max(2025, this_year - 1))
+    return {"tk": tk, "fd": fd, "base": base, "scored": KPI.scored(fd, base), "sla": sla, "reporter": reporter,
+            "team_ids": team_ids, "now": now, "people": [(int(r.user_id), str(r.full_name), str(r.initials)) for r in people.itertuples()],
+            "nudges": KPI.nudges(tk, now), "move": KPI.whose_move(tk, now)}
+
+
+def _hbar(parts: list[tuple[str, float, str]], height: int = 16) -> str:
+    total = sum(v for _, v, _ in parts)
+    if total <= 0:
+        return '<span class="nil">nothing yet</span>'
+    return (f'<div class="hbar" style="height:{height}px">'
+            + "".join(f'<i style="flex:{v:.4f} 1 0;background:{c};height:{height}px" title="{esc(t)}"></i>' for t, v, c in parts if v > 0)
+            + '</div>')
+
+
+def _tile(label: str, value: str, sub: str, year: str, kind: str, chip_text: str, tip: str = "") -> str:
+    c = chip(kind, chip_text, tip)
+    return (f'<div class="kpi" title="{esc(tip)}"><p class="l">{label}</p><p class="v">{value}</p><p class="d">{sub}</p>'
+            f'<p class="y">{year}</p>{c}</div>')
+
+
+def _squares(items: list[tuple[str, str]], small: bool) -> str:
+    """items: (class, tooltip) in display order; a gap is inserted where the class changes."""
+    out, prev = [], None
+    for cls, tip in items:
+        gap = " gap" if prev is not None and cls != prev else ""
+        out.append(f'<i class="{cls}{gap}" title="{esc(tip).replace("&amp;middot;", "&middot;")}"></i>')
+        prev = cls
+    return f'<div class="sq{" sm" if small else ""}">{"".join(out)}</div>'
+
+
+def _trend(values: list[tuple[pd.Period, float | None, int]], base: float | None, cur: pd.Period, min_n: int) -> str:
+    mx = 100.0
+    bars = []
+    for m, v, n in values:
+        if v is None:
+            bars.append('<i style="height:2px;background:var(--b)"></i>')
+            continue
+        cls = "so" if m == cur else ("thin" if n < min_n else "")
+        bars.append(f'<i class="{cls}" style="height:{max(4, v / mx * 100):.0f}%" title="{m.strftime("%b")}: {v:.0f}% of {n}"></i>')
+    line = f'<div class="base" style="bottom:{base / mx * 100:.0f}%" title="baseline level {base:.0f}%"></div>' if base is not None else ""
+    return (f'<div class="mt">{"".join(bars)}{line}</div><div class="mtl">'
+            + "".join(f'<span>{m.strftime("%b")[0]}</span>' for m, _, _ in values) + '</div>')
+
+
+def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, people_on: bool, sync_label: str) -> str:
+    tk, s, base, now = model["tk"], model["scored"], model["base"], model["now"]
+    team_ids = model["team_ids"]
+    names = {uid: n for uid, n, _ in model["people"]}
+    cur = pd.Timestamp(today).to_period("M")
+    year_months = set(pd.period_range(f"{month.year}-01", month, freq="M"))
+    sm = s[s["month"] == month]
+    sy = s[s["month"].isin(year_months)]
+
+    h = ['<div class="dm">']
+    h.append(f'<div class="top"><span class="h1">Ticket health</span><span class="muted">{esc(_month_label(month, today))} &middot; {esc(sync_label)}</span></div>')
+
+    # tiles
+    a_m = KPI.answered_in_time(tk, model["sla"], model["reporter"], team_ids, {month})
+    a_y = KPI.answered_in_time(tk, model["sla"], model["reporter"], team_ids, year_months)
+    a_kind = KPI.chip_level(a_m["pct"], a_m["n"], 90, 80)
+    a_val = f'{a_m["pct"]}%' if a_m["n"] >= KPI.TEAM_PCT_MIN else (f'{a_m["on"]} of {a_m["n"]}' if a_m["n"] else "&mdash;")
+    a_sub = f'{a_m["on"]} of {a_m["n"]}' + (f' &middot; median {a_m["median_h"]:g} business h' if a_m["median_h"] is not None else "")
+    st_m, st_y = KPI.stayed_fixed(sm), KPI.stayed_fixed(sy)
+    lvl = base.stayed_pct
+    if st_m["n"] < KPI.TEAM_PCT_MIN or st_m["pct"] is None or lvl is None:
+        s_kind, s_chip = "none", "Too early to tell"
+    elif st_m["pct"] >= lvl - 0.5:
+        s_kind, s_chip = "good", f"At the {base.year} level"
+    elif st_m["pct"] >= lvl - 5:
+        s_kind, s_chip = "watch", f"Slightly below {base.year}"
+    else:
+        s_kind, s_chip = "bad", f"Below the {base.year} level"
+    s_val = f'{st_m["pct"]}%' if st_m["n"] >= KPI.TEAM_PCT_MIN else (f'{st_m["held"]} of {st_m["n"]}' if st_m["n"] else "&mdash;")
+    s_sub = f'{st_m["held"]} of {st_m["n"]} held' + (f' &middot; {st_m["waiting"]} with the client' if st_m["waiting"] else "")
+    w_pct = round(100 * sm["within_team"].mean()) if len(sm) else None
+    t_kind = KPI.chip_level(w_pct, len(sm), 80, 70)
+    t_val = KPI.fmt_h(float(sm["ours_h"].median())) if len(sm) else "&mdash;"
+    t_sub = f"median on our side &middot; {w_pct}% within usual" if w_pct is not None else "no deliveries this month"
+    nd = model["nudges"]
+    n_kind = "good" if len(nd) == 0 else ("watch" if len(nd) <= 3 else "bad")
+    h.append('<div class="kpis">')
+    h.append(_tile("Answered in time", a_val, a_sub, f'this year {a_y["pct"]}%' if a_y["pct"] is not None else "this year &mdash;", a_kind,
+                   {"good": "On track", "watch": "Watch", "bad": "Needs a look", "none": "Too few to tell"}[a_kind],
+                   "Jira first-response SLA, first cycle, tickets created in the month"))
+    h.append(_tile("Stayed fixed", s_val, s_sub, f'this year {st_y["pct"]}% &middot; {base.year}: {lvl:.0f}%' if st_y["pct"] is not None and lvl else "this year &mdash;",
+                   s_kind, s_chip, "First deliveries in the month: did they come back within 30 days?"))
+    h.append(_tile("Time on our side", t_val, t_sub, f'this year {KPI.fmt_h(float(sy["ours_h"].median())) if len(sy) else "&mdash;"}', t_kind,
+                   {"good": "Usual pace", "watch": "Watch", "bad": "Needs a look", "none": "Too few to tell"}[t_kind],
+                   "Business hours in Open or Under Review with a team member, until first delivery"))
+    h.append(_tile("Could use a nudge", str(len(nd)), "open tickets gone quiet", "live, at the last sync", n_kind,
+                   {"good": "Nothing quiet", "watch": "A few to check", "bad": "Needs a look"}[n_kind]))
+    h.append('</div>')
+    notes = []
+    if a_m["no_sla"]:
+        notes.append(f'{a_m["no_sla"]} tickets created in the month have no Jira first-response target and are not counted.')
+    if not model["reporter"]:
+        notes.append("Tickets raised by staff are included in Answered in time until the next sync adds the reporter type.")
+    if notes:
+        h.append('<p class="pnote">' + " ".join(notes) + '</p>')
+
+    # whose move is it
+    mv = model["move"]
+    order = ["team", "triage", "client", "external", "release", "other_team", "unmapped"]
+    h.append(f'<div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Whose move is it?</span><span class="muted">{mv["total"]} open now</span></div>')
+    h.append(_hbar([(f'{KPI.SIDE_LABEL[k]}: {mv["counts"].get(k, 0)}', mv["counts"].get(k, 0), KPI.SIDE_COLOR[k]) for k in order]))
+    h.append('<div class="hleg">' + "".join(f'<span><span class="sw" style="background:{KPI.SIDE_COLOR[k]}"></span>{KPI.SIDE_LABEL[k]} <b>{mv["counts"][k]}</b></span>'
+                                           for k in order if mv["counts"].get(k)) + '</div>')
+    lines = []
+    if mv["counts"].get("team"):
+        lines.append(f'{mv["ours_over10"]} on our side for more than 10 business days since they reached the team'
+                     + (f' (oldest {mv["ours_oldest_bd"]:.0f})' if mv["ours_oldest_bd"] else ""))
+    if mv["triage"]:
+        lines.append(f'triage {mv["triage"]}, oldest {KPI.fmt_h(mv["triage_oldest_h"])}')
+    if mv["cf"]:
+        lines.append(f'{mv["cf"]} delivered tickets wait for the client to confirm ({mv["cf_30"]} for 30+ days); an auto-close rule in Jira would settle these')
+    if mv["hygiene"]:
+        lines.append(f'{mv["hygiene"]} open again but still marked resolved in Jira, so Jira queues miss them')
+    h.append('<p class="hline">' + " &middot; ".join(lines) + '</p></div>')
+
+    # could use a nudge
+    h.append(f'<div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Could use a nudge &middot; {len(nd)}</span>'
+             '<span class="muted">quiet = no update from the team; a quick update would help</span></div>')
+    if not len(nd):
+        h.append('<p class="sec" style="margin-top:8px">Nothing is sitting quietly.</p>')
+    rows = []
+    for r in nd.itertuples():
+        tags = "".join(f'<span class="tg">{esc(x)}</span>' for x in r.tags.split(", ") if x)
+        who = ""
+        holder = int(r.holder) if isinstance(r.holder, (int, float)) and not pd.isna(r.holder) else None
+        if admin and people_on and r.side not in ("release", "triage") and holder in names:
+            idx = next(i for i, (u, _, _) in enumerate(model["people"]) if u == holder)
+            tint, _, ink = person_color(idx)
+            ini = next(i for u, _, i in model["people"] if u == holder)
+            who = f'<span class="pav2" style="display:inline-flex;width:20px;height:20px;font-size:10px;margin-right:6px;background:{tint};color:{ink}" title="{esc(names[holder])}">{esc(ini)}</span>'
+        tip = f'last public update {r.public_bd:.0f} business days ago' if pd.notna(r.public_bd) else "no public update yet"
+        col = "#a32d2d" if r.ratio >= 2 else "var(--t2)"
+        rows.append(f'<div class="li"><i style="background:{KPI.SIDE_COLOR.get(r.side, "#b4b2a9")}"></i>'
+                    f'<span class="t" title="{esc(r.summary)}">{who}{tags}<a href="{esc(JIRA)}/browse/{esc(r.key)}" target="_blank">{esc(r.key.split("-")[-1])}</a> {esc(r.summary)}</span>'
+                    f'<span class="m">{esc(r.priority)} &middot; {esc(r.status)}</span><span class="r" style="color:{col}" title="{esc(tip)}">quiet {r.quiet_bd:.0f} d</span></div>')
+    h.extend(rows[:12])
+    if len(rows) > 12:
+        h.append(f'<details class="dl"><summary class="sec">Show {len(rows) - 12} more</summary>{"".join(rows[12:])}</details>')
+    h.append('</div>')
+
+    # where the time goes
+    cols = [f"h_{x}" for x in KPI.SIDES]
+    hours = sm[cols].sum() if len(sm) else pd.Series(0.0, index=cols)
+    tot = float(hours.sum())
+    h.append(f'<div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Where the time goes</span>'
+             f'<span class="muted">tickets first delivered in {month.strftime("%B")} &middot; {len(sm)}</span></div>')
+    if len(sm) < 10:
+        h.append('<p class="sec" style="margin-top:8px">Too few tickets this month to show a split.</p>')
+    elif tot <= 0:
+        h.append('<p class="sec" style="margin-top:8px">No business hours on mapped statuses this month. Check the jira_status_map table.</p>')
+    else:
+        h.append(_hbar([(f'{KPI.SIDE_LABEL[k[2:]]}: {100 * v / tot:.0f}%', float(v), KPI.SIDE_COLOR[k[2:]]) for k, v in hours.items()]))
+        h.append('<div class="hleg">' + "".join(f'<span><span class="sw" style="background:{KPI.SIDE_COLOR[k[2:]]}"></span>{KPI.SIDE_LABEL[k[2:]]} <b>{100 * v / tot:.0f}%</b></span>'
+                                               for k, v in hours.items() if tot and v / tot >= 0.005) + '</div>')
+        waits = {k[2:]: v / tot for k, v in hours.items() if k[2:] != "team"}
+        top_side, top_share = max(waits.items(), key=lambda x: x[1])
+        tip = {"client": "Most of the wait is with clients: a reminder after 3 days may help.",
+               "other_team": "Most of the wait is with other teams: agree hand-back times with them.",
+               "external": "Most of the wait is with the bank: a fixed follow-up rhythm may help.",
+               "release": "Most of the wait is for releases: check the release calendar.",
+               "triage": "Most of the wait is in triage: agree who picks up new tickets."}.get(top_side)
+        med_cal = sm["cal_days"].median()
+        line = f'Median {med_cal:.0f} calendar days from creation to delivery; median {KPI.fmt_h(float(sm["ours_h"].median()))} of it on our side.'
+        if top_share > 0.4 and tip:
+            line += " " + tip
+        h.append(f'<p class="hline">{line}</p>')
+        rows = []
+        vc = sm["group"].value_counts()
+        folded = sm.assign(group=[g if vc.get(g, 0) >= 10 else "Other" for g in sm["group"]])
+        for g, x in folded.groupby("group"):
+            gh = x[cols].sum()
+            rows.append(f'<div class="lrow" style="grid-template-columns:160px minmax(0,1fr) 120px"><span class="pname" style="font-weight:400">{esc(g)} &middot; {len(x)}</span>'
+                        f'<div>{_hbar([(KPI.SIDE_LABEL[k[2:]], float(v), KPI.SIDE_COLOR[k[2:]]) for k, v in gh.items()], 12)}</div>'
+                        f'<span class="kc" style="font-size:12px">median {KPI.fmt_h(float(x["ours_h"].median()))} ours</span></div>')
+        if rows:
+            h.append(f'<details class="dl"><summary class="sec">By ticket type</summary>{"".join(rows)}</details>')
+    h.append('</div>')
+
+    # is it getting better?
+    months = list(pd.period_range(f"{month.year}-01", f"{month.year}-12", freq="M"))
+    tr_a, tr_s, tr_w = [], [], []
+    for m in months:
+        if m > cur:
+            tr_a.append((m, None, 0)); tr_s.append((m, None, 0)); tr_w.append((m, None, 0))
+            continue
+        am = KPI.answered_in_time(tk, model["sla"], model["reporter"], team_ids, {m})
+        x = s[s["month"] == m]
+        sf = KPI.stayed_fixed(x)
+        tr_a.append((m, am["pct"], am["n"]))
+        tr_s.append((m, sf["pct"], sf["n"]))
+        tr_w.append((m, 100 * x["within_team"].mean() if len(x) else None, len(x)))
+    base_months = set(pd.period_range(f"{base.year}-01", f"{base.year}-12", freq="M"))
+    a25 = KPI.answered_in_time(tk, model["sla"], model["reporter"], team_ids, base_months)["pct"]
+    s25 = s[s["month"].isin(base_months)]
+    w25 = 100 * s25["within_team"].mean() if len(s25) else None
+    h.append(f'<div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Is it getting better?</span>'
+             f'<span class="muted">{month.year} by month &middot; dashed line = {base.year} level &middot; faded = so far, outlined = under {KPI.TEAM_PCT_MIN} tickets</span></div><div class="trends">')
+    for label, vals, b in [("Answered in time", tr_a, a25), ("Stayed fixed", tr_s, lvl), ("Within usual time", tr_w, w25)]:
+        h.append(f'<div class="tr"><p class="l">{label}</p>{_trend(vals, b, cur, KPI.TEAM_PCT_MIN)}</div>')
+    h.append('</div></div>')
+
+    # people: manager only, and only when switched on
+    if admin and not people_on:
+        h.append('<div class="pframe"><p class="sec">Per-person ticket figures are switched off. After the HR/privacy check, set '
+                 '<code>ticket_people_view = true</code> under <code>[app]</code> in the app secrets to show them here, to you only.</p></div>')
+    if admin and people_on:
+        small = any(len(sm[sm["main_owner"] == uid]) > 22 for uid, _, _ in model["people"])
+        h.append('<div class="pframe"><div class="top"><span class="h1">People &middot; tickets</span><span class="muted">only you can see this section</span></div>')
+        h.append('<p class="sec">Naveen works outside Jira and is not shown here.</p>')
+        # stayed fixed squares
+        h.append(f'<div class="pcard"><div class="top"><span class="h2">Stayed fixed</span><span class="muted">{esc(month.strftime("%B"))} &middot; one square = one ticket</span></div>'
+                 '<p class="q">Did it stay fixed after we delivered? Counted 30 days after delivery.</p>'
+                 f'<p class="lead">Together the team: <b>{st_m["held"]} of {st_m["n"]}</b> settled held'
+                 + (f' ({st_m["pct"]}%)' if st_m["n"] >= KPI.TEAM_PCT_MIN else "") + (f'. {st_m["waiting"]} still with the client.' if st_m["waiting"] else ".") + '</p>')
+        for idx, (uid, name, ini) in enumerate(model["people"]):
+            g = sm[sm["main_owner"] == uid].sort_values("fd_at")
+            kind, label, e = KPI.person_label_returns(g)
+            sq = ([("s-held", f'{r.key} &middot; {r.issue_type} &middot; delivered {r.fd_at:%d %b}') for r in g.itertuples() if r.outcome == "held"]
+                  + [("s-back", f'{r.key} &middot; {r.issue_type} &middot; delivered {r.fd_at:%d %b}, came back {r.came_back_at:%d %b}') for r in g.itertuples() if r.outcome == "came_back"]
+                  + [("s-wait", f'{r.key} &middot; {r.issue_type} &middot; delivered {r.fd_at:%d %b}, still with the client') for r in g.itertuples() if r.outcome == "waiting"])
+            sf = KPI.stayed_fixed(g)
+            right = (f'<div class="kc"><b>{sf["held"]}</b> of {sf["n"]} held<small>{sf["came_back"]} came back &middot; about {e:.0f} expected</small></div>'
+                     if sf["n"] else '<div class="kc"><b class="dim">&mdash;</b></div>')
+            h.append(f'<div class="crow"><div class="pwho">{pav({"idx": idx, "ini": ini})}<div><p class="pname">{esc(name)}</p>{chip(kind, label, HEALTH_PERSON_TIP)}</div></div>'
+                     + (_squares(sq, small) if sq else '<span class="nil">Nothing delivered this month</span>') + right + '</div>')
+        h.append('<div class="end"></div><div class="legend" style="flex-wrap:wrap"><span><span class="sw s-held"></span>held</span>'
+                 '<span><span class="sw s-back"></span>came back within 30 days</span><span><span class="sw s-wait"></span>still with the client (not scored)</span></div>'
+                 f'<p class="pnote">Labels from {KPI.PERSON_LABEL_MIN} settled tickets; compared with the team&#39;s 2025 results on the same ticket types.</p></div>')
+        # within usual time squares
+        h.append(f'<div class="pcard"><div class="top"><span class="h2">Within usual time</span><span class="muted">same tickets &middot; own time on our side vs usual for the type</span></div>')
+        for idx, (uid, name, ini) in enumerate(model["people"]):
+            g = sm[sm["main_owner"] == uid].sort_values("fd_at")
+            kind, label, e = KPI.person_label_time(g)
+            sq = ([("s-in", f'{r.key} &middot; {r.issue_type} &middot; own {KPI.fmt_h(r.own_h)}') for r in g.itertuples() if r.within_own]
+                  + [("s-slow", f'{r.key} &middot; {r.issue_type} &middot; own {KPI.fmt_h(r.own_h)}, usual {KPI.fmt_h(base.usual_own.get(r.group, base.usual_own["Other"]))}')
+                     for r in g.itertuples() if not r.within_own])
+            ok = int(g["within_own"].sum())
+            right = (f'<div class="kc"><b>{ok}</b> of {len(g)} within usual<small>{len(g) - ok} took longer &middot; about {e:.0f} expected</small></div>'
+                     if len(g) else '<div class="kc"><b class="dim">&mdash;</b></div>')
+            h.append(f'<div class="crow"><div class="pwho">{pav({"idx": idx, "ini": ini})}<div><p class="pname">{esc(name)}</p>{chip(kind, label, HEALTH_PERSON_TIP)}</div></div>'
+                     + (_squares(sq, small) if sq else '<span class="nil">Nothing delivered this month</span>') + right + '</div>')
+        h.append('<div class="end"></div><div class="legend"><span><span class="sw s-in"></span>within usual</span><span><span class="sw s-slow"></span>took longer</span></div></div>')
+        # on their plate (open tickets now, by side)
+        mx = max([len(v) for v in mv["by_holder"].values()] + [6])
+        h.append('<div class="pcard"><div class="top"><span class="h2">On their plate</span><span class="muted">open tickets now, by whose move it is</span></div>')
+        for idx, (uid, name, ini) in enumerate(model["people"]):
+            mine = mv["by_holder"].get(uid, [])
+            cnt = {}
+            for t in mine:
+                cnt[t.side_now] = cnt.get(t.side_now, 0) + 1
+            bar = (f'<div><div class="lbar" style="width:{100 * len(mine) / mx:.0f}%">'
+                   + "".join(f'<i style="flex:{cnt[k]} 1 0;background:{KPI.SIDE_COLOR[k]}" title="{cnt[k]} {KPI.SIDE_LABEL[k].lower()}"></i>' for k in order if cnt.get(k))
+                   + '</div></div>') if mine else '<span class="nil">Nothing open</span>'
+            h.append(f'<div class="lrow"><div class="pwho">{pav({"idx": idx, "ini": ini})}<div><p class="pname">{esc(name)}</p></div></div>{bar}'
+                     f'<div class="kc"><b>{len(mine)}</b> open<small>{cnt.get("team", 0)} on our side</small></div><div></div></div>')
+        h.append('<div class="end"></div></div>')
+        # where their tickets waited
+        h.append(f'<div class="pcard"><div class="top"><span class="h2">Where their tickets waited</span><span class="muted">context, not scored &middot; {esc(month.strftime("%B"))}</span></div>')
+        for idx, (uid, name, ini) in enumerate(model["people"]):
+            g = sm[sm["main_owner"] == uid]
+            if len(g) < KPI.PERSON_BAR_MIN:
+                bar, right = '<span class="nil">Too few to show</span>', ""
+            else:
+                gh = g[cols].sum()
+                bar = f'<div>{_hbar([(KPI.SIDE_LABEL[k[2:]], float(v), KPI.SIDE_COLOR[k[2:]]) for k, v in gh.items()], 12)}</div>'
+                right = f'median {KPI.fmt_h(float(g["ours_h"].median()))} ours'
+            h.append(f'<div class="lrow"><div class="pwho">{pav({"idx": idx, "ini": ini})}<div><p class="pname">{esc(name)}</p></div></div>{bar}'
+                     f'<div class="kc" style="font-size:12px">{right}</div><div></div></div>')
+        h.append('<div class="end"></div></div></div>')
+    h.append('</div>')
+    return "".join(h)
+
+
+def health_tab() -> None:
+    last = last_sync_at()
+    if last is None:
+        st.info("No Jira data yet. Run supabase_jira_sync.sql in Supabase, then a first sync (Manage tab, or the GitHub job).")
+        return
+    model = health_model(last.isoformat())
+    if model is None:
+        st.info("The Jira tables are not there yet. Run supabase_jira_sync.sql in Supabase, then a first sync.")
+        return
+    menu = _months_menu(today, model["base"].year)
+    default = 1 if len(menu) > 1 else 0          # last full month
+    month = st.selectbox("Month", menu, index=default, format_func=lambda m: _month_label(m, today), key="h_month",
+                         help="Calendar months, no rolling windows. Whose move and nudges are always live.")
+    people_on = str(secret("app", "ticket_people_view", "false")).lower() in ("true", "1", "yes")
+    label = f"synced {last.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}"
+    st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + HEALTH_CSS
+                + render_health(model, month, today, bool(st.session_state.get("is_admin")), people_on, label), unsafe_allow_html=True)
+    with st.expander("How these are measured"):
+        st.markdown(HEALTH_HELP)
+
+
+# ----------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------
-tab_pulse, tab_tickets, tab_metrics, tab_admin, tab_excel = st.tabs(["Team pulse", "Tickets", "Metrics", "Manage", "Excel"])
+tab_pulse, tab_tickets, tab_health, tab_metrics, tab_admin, tab_excel = st.tabs(["Team pulse", "Tickets", "Ticket health", "Metrics", "Manage", "Excel"])
 
+maybe_auto_sync()
 try:
     items, team = load()
     tickets, report_date = load_tickets()
@@ -1441,7 +2164,12 @@ with tab_pulse:
 
 with tab_tickets:
     tickets = tickets.copy()
-    tickets["age"] = [(report_date - c).days if is_date(c) else 0 for c in tickets["created"]]
+    tickets["age"] = [((r if is_date(r) else report_date) - c).days if is_date(c) else 0
+                      for c, r in zip(tickets["created"], tickets["resolved"])]
+    team_only = st.toggle("Only tickets assigned to the team", value=True, key="t_team",
+                          help="Off = also tickets once handled by the team but now assigned to someone else")
+    if team_only:
+        tickets = where(tickets, tickets["on_team"])
 
     def opts(col: str) -> list[str]:
         return sorted(tickets[col].unique().tolist())
@@ -1469,7 +2197,10 @@ with tab_tickets:
         ]
     sel_t = where(tickets, mask).copy()
 
-    st.markdown(CSS + render_tickets(sel_t, len(tickets), report_date), unsafe_allow_html=True)
+    if f_asg and not st.session_state.get("is_admin"):
+        st.caption("Totals are hidden while a person is selected: per-person ticket counts are for the manager only.")
+    else:
+        st.markdown(CSS + render_tickets(sel_t, len(tickets), report_date, bool(st.session_state.get("is_admin"))), unsafe_allow_html=True)
 
     sel_t["_prio"] = [PRIO_ORDER.get(p, 9) for p in sel_t["priority"]]
     sel_t["_created"] = [c if is_date(c) else dt.date(1900, 1, 1) for c in sel_t["created"]]
@@ -1483,16 +2214,25 @@ with tab_tickets:
     show = sel_t.sort_values(by=order[0], ascending=order[1])
     st.markdown(CSS + tickets_table(show, JIRA), unsafe_allow_html=True)
 
-    csv = show[["number", "key", "state", "priority", "summary", "assignee", "created", "age"]].rename(columns={
-        "number": "No.", "key": "Key", "state": "State", "priority": "Priority", "summary": "Summary", "assignee": "Assignee",
-        "created": "Created", "age": "Age (days)",
+    csv = show[["number", "key", "state", "jira_status", "priority", "summary", "assignee", "created", "age"]].rename(columns={
+        "number": "No.", "key": "Key", "state": "State", "jira_status": "Status", "priority": "Priority", "summary": "Summary",
+        "assignee": "Assignee", "created": "Created", "age": "Age (days)",
     })
     c1, c2, c3 = st.columns([3, 1, 1])
-    c1.caption(f"Source: Supabase &middot; loaded {loaded_at} &middot; snapshot {report_date:%d %b %Y}", unsafe_allow_html=True)
+    _ls = last_sync_at()
+    c1.caption(f"Source: Jira, synced {_ls.astimezone(KPI.WORK_TZ):%d %b %H:%M}" if _ls else f"Source: Supabase &middot; snapshot {report_date:%d %b %Y}",
+               unsafe_allow_html=True)
     c2.download_button("Download CSV", csv.to_csv(index=False).encode("utf-8-sig"), file_name=f"tickets_{report_date:%Y%m%d}.csv", mime="text/csv", use_container_width=True, key="t_dl")
     if c3.button("Refresh", use_container_width=True, key="t_refresh"):
         st.cache_data.clear()
         st.rerun()
+
+with tab_health:
+    try:
+        health_tab()
+    except Exception as e:  # noqa: BLE001 - keep the other tabs working
+        st.error(f"Ticket health could not be shown right now: {str(e).splitlines()[0][:200]}")
+
 
 def excel_tab() -> None:
     st.markdown("**Export**", unsafe_allow_html=True)
@@ -1594,6 +2334,31 @@ with tab_admin:
         st.session_state["is_admin"] = False
         st.rerun()
 
+    with st.expander("Jira sync", expanded=False):
+        _ls = last_sync_at()
+        st.caption((f"Last sync {_ls.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}. " if _ls else "Not synced yet. ")
+                   + f"The app fetches the latest Jira changes whenever someone opens it and the data is over {AUTO_SYNC_AFTER_MIN} minutes old.")
+        if not secret("jira", "api_token", ""):
+            st.info("To sync from here, add a [jira] section to the app secrets: base_url, email, api_token, project.")
+        else:
+            j1, j2 = st.columns(2)
+            mode = "incremental" if j1.button("Sync changes now", key="jira_inc", use_container_width=True) else (
+                "full" if j2.button("Full re-sync (about 10 minutes)", key="jira_full", use_container_width=True) else None)
+            if mode:
+                with st.status(f"{mode.capitalize()} sync from Jira...", expanded=True) as box:
+                    try:
+                        res = run_jira_sync(mode, log=box.write)
+                        st.session_state["_sync_msg"] = f"Synced {res['tickets']} tickets in {res['seconds']} s."
+                        st.rerun()
+                    except (Exception, SystemExit) as e:  # noqa: BLE001
+                        box.update(label="Sync failed", state="error")
+                        st.error(str(e).splitlines()[0])
+            if st.session_state.get("_sync_msg"):
+                st.success(st.session_state.pop("_sync_msg"))
+        _err = _auto_sync_state().get("last_error")
+        if _err:
+            st.caption(f"Last automatic catch-up failed: {_err}")
+
     users_all = query("select user_id, full_name, initials, active from users order by user_id")
     users_all["active"] = users_all["active"].astype(bool)
     name_to_id = {str(n): int(i) for i, n in zip(users_all["user_id"], users_all["full_name"])}
@@ -1658,7 +2423,7 @@ with tab_admin:
             "config": {
                 "ticket_id": st.column_config.NumberColumn("Number", format="%d", required=True, help="Jira number without the MYDSUP- prefix"),
                 "summary": st.column_config.TextColumn("Summary", width="large", required=True),
-                "priority": st.column_config.SelectboxColumn("Priority", options=PRIORITIES, default="Normal", required=True),
+                "priority": st.column_config.SelectboxColumn("Priority", options=PRIORITIES, default="Medium", required=True),
                 "state": st.column_config.SelectboxColumn("State", options=["Open", "Closed"], default="Open", required=True),
                 "assignee": st.column_config.SelectboxColumn("Assignee", options=list(name_to_id) + ["Unassigned"], default="Unassigned"),
                 "organization": st.column_config.TextColumn("Organization"),

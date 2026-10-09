@@ -1,9 +1,9 @@
-"""Sync the team's MYDSUP tickets from Jira Cloud into the dashboard database.
+"""Sync every MYDSUP ticket from Jira Cloud into the dashboard database.
 
 Read-only on Jira: it only searches and reads. It never changes a ticket.
 
     python jira_sync.py                 # incremental: tickets updated since the last run
-    python jira_sync.py --mode full     # every ticket ever assigned to a team member
+    python jira_sync.py --mode full     # every ticket in the project (history for the current and previous year)
 
 Configuration, first one found wins:
   1. environment: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT, DATABASE_URL  (GitHub Actions)
@@ -40,6 +40,7 @@ FIELDS = ["summary", "status", "resolution", "resolutiondate", "created", "updat
 OPEN_STATUSES_JQL = '"Pending Inbox", Open, "Under Review", "Waiting for customer", "Waiting for Bank", "Awaiting Delivery"'
 EVENT_FIELDS = {"status", "assignee", "resolution", "priority", "issuetype", "Request Type"}
 UTC = dt.timezone.utc
+CHUNK = 200                                 # tickets handled per round: memory stays flat on Streamlit Cloud
 LOCAL_TZ = ZoneInfo("Europe/Rome")          # calendar dates shown in the app
 
 
@@ -243,59 +244,59 @@ def _details(proto: Jira, issue: dict, cutoff: dt.datetime | None = None):
     return issue, histories, comments
 
 
-def _purge_old(engine: sa.Engine, store: "Store", cutoff: dt.datetime) -> None:
-    """Retention: drop the history of tickets last updated before the previous calendar year."""
-    tk = store.t["tickets"]
-    old = sa.select(tk.c.ticket_id).where(tk.c.updated_at < cutoff).scalar_subquery()
-    with engine.begin() as c:
-        for name in ("jira_events", "jira_comments", "jira_sla"):
-            t = store.t[name]
-            c.execute(sa.delete(t).where(t.c.ticket_id.in_(old)))
+def _chunks(items, n: int):
+    buf = []
+    for x in items:
+        buf.append(x)
+        if len(buf) >= n:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
 
 
-def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print, workers: int = 4) -> dict:
+def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print, workers: int = 6) -> dict:
     store = Store(engine)
     people = store.people()
     # Sign in first: with a wrong email/token Jira answers searches as for an anonymous visitor (no tickets,
     # no error). /myself refuses instead (401), so bad credentials stop here, before anything is written.
     me = jira.get("/rest/api/3/myself")
     log(f"signed in to Jira as {me.get('displayName', '?')}")
+    seen = jira.post("/rest/api/3/search/approximate-count", {"jql": f"project = {jira.project}"}).get("count")
+    if not seen:
+        raise PermissionError(f"Signed in to Jira as {me.get('displayName', '?')}, but this account cannot see any "
+                              f"{jira.project} ticket, so nothing was changed. Use the account that can open {jira.project}.")
     started = dt.datetime.now(UTC)
     tk = store.t["tickets"]
     with engine.connect() as c:                   # tickets already holding Jira data, for the safety check below
         had = c.execute(sa.select(sa.func.count()).select_from(tk).where(tk.c.jira_key.is_not(None))).scalar() or 0
-    ids = ",".join(f'"{a}"' for a in people.team)
-    jql = f"project = {jira.project} AND (assignee in ({ids}) OR assignee was in ({ids}))"
+    project = f"project = {jira.project}"
+    cutoff = dt.datetime(started.year - 1, 1, 1, tzinfo=UTC)      # retention: history for the current and previous year
     last = store.get_state("last_sync_at")
     if mode != "full" and last:
         minutes = int((started - dt.datetime.fromisoformat(last)).total_seconds() // 60) + 20
         # changed tickets, plus every open one so its live SLA flags stay fresh
-        jql += f" AND (updated >= -{minutes}m OR status in ({OPEN_STATUSES_JQL}))"
-    elif mode != "full":
+        passes = [(f"{project} AND (updated >= -{minutes}m OR status in ({OPEN_STATUSES_JQL}))", "changelog")]
+    else:
         mode = "full"
-    log(f"{mode} sync: {'changed and open tickets' if mode != 'full' else 'all tickets'}")
-    issues = list(jira.search(jql + " ORDER BY updated ASC", FIELDS, expand="changelog", page=50))
-    log(f"{len(issues)} tickets to sync")
-    if mode == "full" and not issues:
-        raise RuntimeError(f"Jira returned no {jira.project} tickets for the team, so nothing was changed. "
-                           "Check that the Jira account in the secrets can open the project.")
-    cutoff = dt.datetime(started.year - 1, 1, 1, tzinfo=UTC)      # retention: current and previous year
-    if mode == "full":
-        _purge_old(engine, store, cutoff)
-    done, batch = 0, []
+        since = cutoff.strftime("%Y-%m-%d")
+        # recent tickets with their history; older ones as rows only (their history is not kept)
+        passes = [(f'{project} AND updated >= "{since}"', "changelog"), (f'{project} AND updated < "{since}"', None)]
+    log(f"{mode} sync: {'changed and open tickets' if mode != 'full' else f'every {jira.project} ticket, about {seen}'}")
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for got in pool.map(lambda i: _details(jira, i, cutoff), issues):
-            if got is None:
-                continue
-            issue, histories, comments = got
-            batch.append(build_bundle(issue, histories, comments, people))
-            if len(batch) >= 50:
+        for jql, expand in passes:
+            pages = jira.search(jql + " ORDER BY key ASC", FIELDS, expand=expand, page=50 if expand else 100)
+            for chunk in _chunks(pages, CHUNK):
+                batch = [build_bundle(*got, people) for got in pool.map(lambda i: _details(jira, i, cutoff), chunk)
+                         if got is not None]
                 store.save(batch)
+                if (done + len(batch)) // 1000 > done // 1000 or mode != "full":
+                    log(f"  saved {done + len(batch)} tickets")
                 done += len(batch)
-                batch = []
-                log(f"  saved {done}/{len(issues)}")
-    store.save(batch)
-    done += len(batch)
+    if mode == "full" and not done:
+        raise RuntimeError(f"Jira returned no {jira.project} tickets, so nothing was changed. "
+                           "Check that the Jira account in the secrets can open the project.")
     summary = {"mode": mode, "tickets": done, "started": started.isoformat(),
                "seconds": round((dt.datetime.now(UTC) - started).total_seconds(), 1)}
     # far fewer tickets than stored: more likely lost permissions than half the tickets gone
@@ -309,6 +310,10 @@ def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print
             log(f"only {done} tickets returned against {had} stored: tickets not returned were left as they are")
         elif mode == "full":
             store.set_state(c, "last_full_sync_at", started.isoformat())
+            # retention: no history for tickets last updated before the previous calendar year
+            old = sa.select(tk.c.ticket_id).where(tk.c.updated_at < cutoff).scalar_subquery()
+            for name in ("jira_events", "jira_comments", "jira_sla"):
+                c.execute(sa.delete(store.t[name]).where(store.t[name].c.ticket_id.in_(old)))
             # tickets Jira no longer returns (deleted, moved out of MYDSUP, old snapshot rows): close them, drop their history
             stale = sa.or_(tk.c.synced_at.is_(None), tk.c.synced_at < started)
             gone = sa.select(tk.c.ticket_id).where(stale).scalar_subquery()

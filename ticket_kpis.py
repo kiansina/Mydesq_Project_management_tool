@@ -151,7 +151,16 @@ def build(tickets: pd.DataFrame, events: pd.DataFrame, comments: pd.DataFrame, s
     ev["at"] = [_utc(x) for x in ev["at"]]
     sort_cols = [c for c in ("at", "history_id", "item_no") if c in ev.columns]
     ev = ev.sort_values(["ticket_id"] + sort_cols)
-    ev_by = {int(k): g for k, g in ev.groupby("ticket_id", sort=False)}
+    # one pass into plain per-ticket lists: filtering the frame for every ticket was the slow part on big projects
+    st_by, as_by, team_at = {}, {}, {}
+    for r in ev.itertuples(index=False):
+        tid = int(r.ticket_id)
+        if r.field == "status":
+            st_by.setdefault(tid, []).append(r)
+        elif r.field == "assignee":
+            as_by.setdefault(tid, []).append(r)
+        if r.author_type == "team" and r.at is not None and not pd.isna(r.at) and (tid not in team_at or r.at > team_at[tid]):
+            team_at[tid] = r.at
     cm = comments.copy()
     cm["created_at"] = [_utc(x) for x in cm["created_at"]]
     cm = cm[cm["author_type"] == "team"]
@@ -168,11 +177,8 @@ def build(tickets: pd.DataFrame, events: pd.DataFrame, comments: pd.DataFrame, s
         tid, created = int(t.ticket_id), _utc(t.created_at)
         if created is None:
             continue
-        g = ev_by.get(tid)
-        st_ev = g[g["field"] == "status"] if g is not None else None
-        as_ev = g[g["field"] == "assignee"] if g is not None else None
-        st_rows = list(st_ev.itertuples()) if st_ev is not None else []
-        as_rows = list(as_ev.itertuples()) if as_ev is not None else []
+        st_rows = st_by.get(tid, [])
+        as_rows = as_by.get(tid, [])
         aid = getattr(t, "assignee_id", None)
         holder_now = int(aid) if aid is not None and not pd.isna(aid) else ("other" if isinstance(getattr(t, "assignee_name", None), str) and t.assignee_name else None)
         status_now = str(t.jira_status or "")
@@ -197,8 +203,7 @@ def build(tickets: pd.DataFrame, events: pd.DataFrame, comments: pd.DataFrame, s
         first_assignee = next((s.holder for s in segs if s.holder is not None), None)
         arrival = next((s.start for s in segs if isinstance(s.holder, int)), None)
         team_passes = sum(1 for r in as_rows if not pd.isna(r.from_user_id) and not pd.isna(r.to_user_id) and int(r.from_user_id) != int(r.to_user_id))
-        tev = g[g["author_type"] == "team"]["at"].max() if g is not None and len(g) else None
-        touches = [x for x in (last_cm.get(tid), tev if tev is not None and not pd.isna(tev) else None) if x is not None]
+        touches = [x for x in (last_cm.get(tid), team_at.get(tid)) if x is not None]
         res = getattr(t, "resolution", None)
         tk = Ticket(
             ticket_id=tid, key=str(t.jira_key), summary=str(t.summary), issue_type=str(getattr(t, "issue_type", "") or ""),

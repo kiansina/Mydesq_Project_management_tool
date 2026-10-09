@@ -80,6 +80,15 @@ def esc(s) -> str:
     return html.escape("" if s is None or (isinstance(s, float) and pd.isna(s)) else " ".join(str(s).split()))
 
 
+TEAM_OF: dict[str, str] = {}          # full name -> team name, filled after the data is loaded
+
+
+def team_tag(name: str) -> str:
+    """Small grey team label after a person's name (nothing before teams are set up)."""
+    t = TEAM_OF.get(name, "")
+    return f' <span class="tm">{esc(t)}</span>' if t else ""
+
+
 def plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
 
@@ -122,12 +131,21 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
         join users u on u.user_id = d.user_id
         order by d.deliverable_id
     """)
-    team = query("""
-        select full_name as name, initials, active
-        from users
-        where active
-        order by user_id
-    """)
+    try:
+        team = query("""
+            select u.full_name as name, u.initials, u.active, coalesce(t.name, '') as team
+            from users u left join teams t on t.team_id = u.team_id
+            where u.active
+            order by coalesce(t.sort_order, 999), t.name, u.user_id
+        """)
+    except Exception:  # noqa: BLE001 - before supabase_teams.sql: no teams yet
+        team = query("""
+            select full_name as name, initials, active
+            from users
+            where active
+            order by user_id
+        """)
+        team["team"] = ""
     for c in ["discussed_on", "due_original", "due_current", "completed_on"]:
         items[c] = to_dates(items[c])
     items["status"] = items["status"].astype(str).str.strip().replace("", "Planned")
@@ -135,6 +153,7 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
     items["deliverable"] = items["deliverable"].astype(str).str.strip()
     items["is_extra"] = [bool(x) for x in items["is_extra"]]
     team["name"] = team["name"].astype(str).str.strip()
+    team["team"] = team["team"].fillna("").astype(str).str.strip()
     team["initials"] = [str(i).strip() or n[:2] for i, n in zip(team["initials"], team["name"])]
     return items, team
 
@@ -407,6 +426,7 @@ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--t1);max-wi
 .dm .pch{display:flex;align-items:center;gap:12px;padding:10px 14px}
 .dm .pav{width:34px;height:34px;border-radius:50%;color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:500;flex:none}
 .dm .pnm{font-size:16px;font-weight:500;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dm .tm{font-size:11px;font-weight:400;color:#898781;margin-left:2px;white-space:nowrap}
 .dm .pchips{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .dm .pk{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 9px;border-radius:10px;background:rgba(255,255,255,.8);color:var(--t1);white-space:nowrap}
 .dm .pk i{width:8px;height:8px;border-radius:50%;display:inline-block}
@@ -488,7 +508,7 @@ def person_header(name: str, ini: str, mine: pd.DataFrame, color: tuple[str, str
     chips = "".join(f'<span class="pk"><i style="background:{c}"></i>{n} {label}</span>' for n, label, c in counts if n)
     return (f'<div class="pc"><div class="pch" style="background:{tint}">'
             f'<div class="pav" style="background:{fill}">{esc(ini)}</div>'
-            f'<div class="pnm" style="color:{ink}" title="{esc(name)}">{esc(name)}</div>'
+            f'<div class="pnm" style="color:{ink}" title="{esc(name)}">{esc(name)}{team_tag(name)}</div>'
             f'<div class="pchips">{chips}</div></div>')
 
 
@@ -645,7 +665,7 @@ def render(m: dict, today: dt.date, initials: dict[str, str], scope: str = "all 
             k, kc = "On time &mdash; &middot; streak 0", "k"
         else:
             k, kc = "Add first deliverable", "k link"
-        h.append(f'<div class="card"><div class="who"><div class="av" style="background:{fill};color:#fff">{esc(p["initials"])}</div><div><p class="n">{esc(p["name"])}</p><p class="s">{s}</p></div></div><p class="{kc}">{k}</p></div>')
+        h.append(f'<div class="card"><div class="who"><div class="av" style="background:{fill};color:#fff">{esc(p["initials"])}</div><div><p class="n">{esc(p["name"])}{team_tag(p["name"])}</p><p class="s">{s}</p></div></div><p class="{kc}">{k}</p></div>')
     h.append('</div></div>')
 
     # Wins
@@ -868,8 +888,13 @@ def sheet_name(full_name: str) -> str:
 def export_workbook(items: pd.DataFrame, team: pd.DataFrame) -> bytes:
     """One sheet per active person: id, #deliverable, discussion_date, due date, Comment, ticket, status, extra."""
     buf = io.BytesIO()
+    used = set()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         for name in team["name"]:
+            sheet = sheet_name(name)
+            if sheet.lower() in used:               # same first name as someone before: use the full name
+                sheet = re.sub(r"[\[\]:*?/\\]", "", name)[:31]
+            used.add(sheet.lower())
             mine = where(items, items["owner"] == name).sort_values("id")
             df = pd.DataFrame({
                 "id": range(1, len(mine) + 1),
@@ -881,8 +906,8 @@ def export_workbook(items: pd.DataFrame, team: pd.DataFrame) -> bytes:
                 "status": mine["status"].tolist(),
                 "extra": ["yes" if x else "" for x in extra_flags(mine)],
             })
-            df.to_excel(xw, sheet_name=sheet_name(name), index=False)
-            ws = xw.sheets[sheet_name(name)]
+            df.to_excel(xw, sheet_name=sheet, index=False)
+            ws = xw.sheets[sheet]
             for col, w in zip("ABCDEFGH", [5, 60, 16, 16, 40, 14, 12, 8]):
                 ws.column_dimensions[col].width = w
             ws.freeze_panes = "A2"
@@ -1509,7 +1534,7 @@ def render_commitments(people: list[dict], mode_label: str) -> str:
     for p in people:
         s = p["s"]
         h.append('<div class="crow">')
-        h.append(f'<div class="pwho">{pav(p)}<div><p class="pname" title="{esc(p["name"])}">{esc(p["name"])}</p>{chip(p["kind"], p["label"])}</div></div>')
+        h.append(f'<div class="pwho">{pav(p)}<div><p class="pname" title="{esc(p["name"])}">{esc(p["name"])}{team_tag(p["name"])}</p>{chip(p["kind"], p["label"])}</div></div>')
         if s["settled"]:
             sq = []
             gap_done = False
@@ -1566,7 +1591,7 @@ def render_load(people: list[dict]) -> str:
     for p in people:
         L = p["L"]
         h.append('<div class="lrow">')
-        h.append(f'<div class="pwho">{pav(p)}<div><p class="pname" title="{esc(p["name"])}">{esc(p["name"])}</p></div></div>')
+        h.append(f'<div class="pwho">{pav(p)}<div><p class="pname" title="{esc(p["name"])}">{esc(p["name"])}{team_tag(p["name"])}</p></div></div>')
         if L["open_total"]:
             segs = []
             for key, cls, label in segs_def:
@@ -1643,7 +1668,7 @@ def render_person_detail(p: dict, today: dt.date) -> str:
     s, L, c_all = p["s"], p["L"], p["c_all"]
     h = ['<div class="dm"><div class="panel">']
     h.append(f'<div class="phd" style="background:{tint}"><div class="pav" style="background:{fill};width:36px;height:36px">{esc(p["ini"])}</div>'
-             f'<div class="pnm" style="color:{ink}" title="{esc(p["name"])}">{esc(p["name"])}</div>{chip(p["kind"], p["label"])}</div>')
+             f'<div class="pnm" style="color:{ink}" title="{esc(p["name"])}">{esc(p["name"])}{team_tag(p["name"])}</div>{chip(p["kind"], p["label"])}</div>')
     if not len(c_all):
         h.append(f'<p class="sec" style="margin-top:10px">No deliverables recorded for {esc(p["name"])} yet.</p></div></div>')
         return "".join(h)
@@ -1723,7 +1748,7 @@ def render_person_detail(p: dict, today: dt.date) -> str:
 
 def build_people(mode: str, mode_label: str) -> list[dict]:
     people = []
-    for idx, (n, ini) in enumerate(zip(team["name"], team["initials"])):
+    for idx, (n, ini) in enumerate(zip(MODULE_TEAM["name"], MODULE_TEAM["initials"])):
         c_all = classify(where(items, items["owner"] == n), today)
         s = commit_stats(by_mode(c_all, mode))
         kind, label = commit_verdict(s["kept"], s["settled"])
@@ -1738,14 +1763,15 @@ def metrics_tab() -> None:
     mode = MODES[mode_label]
     tk = open_ticket_counts(tickets)
     team_m = metrics_for(items, sum(tk.values()), today, mode)
-    per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today, mode)) for n, i in zip(team["name"], team["initials"])]
+    per = [(n, str(i), metrics_for(where(items, items["owner"] == n), tk.get(n, 0), today, mode))
+           for n, i in zip(MODULE_TEAM["name"], MODULE_TEAM["initials"])]
 
     st.markdown(CSS + METRIC_CSS + render_team_metrics(team_m, today, mode_label, "Team metrics" if SEE_ALL else "My metrics"),
                 unsafe_allow_html=True)
     items_m = by_mode(items, mode)
     show_label = st.radio("Workload shows", list(WORKLOAD_SHOW), horizontal=True, key="m_wl",
                           help="Open = still to do, by due date. Delivered = done, by completion date. All = both.")
-    st.markdown(CSS + METRIC_CSS + render_workload(workload(items_m, names, today, WORKLOAD_SHOW[show_label]), mode_label, show_label), unsafe_allow_html=True)
+    st.markdown(CSS + METRIC_CSS + render_workload(workload(items_m, MODULE_NAMES, today, WORKLOAD_SHOW[show_label]), mode_label, show_label), unsafe_allow_html=True)
     st.markdown(CSS + METRIC_CSS + render_blocked(items_m, today), unsafe_allow_html=True)
 
     people = build_people(mode, mode_label)
@@ -1757,9 +1783,9 @@ def metrics_tab() -> None:
         return
     st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_people(people, mode_label), unsafe_allow_html=True)
     if people:
-        if st.session_state.get("m_person") is not None and st.session_state["m_person"] not in names:
+        if st.session_state.get("m_person") is not None and st.session_state["m_person"] not in MODULE_NAMES:
             del st.session_state["m_person"]
-        who = st.selectbox("Look at one person", names, index=None, placeholder="Choose a person", key="m_person")
+        who = st.selectbox("Look at one person", MODULE_NAMES, index=None, placeholder="Choose a person", key="m_person")
         for p in people:
             if p["name"] == who:
                 st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + render_person_detail(p, today), unsafe_allow_html=True)
@@ -2307,6 +2333,8 @@ except Exception as e:  # noqa: BLE001 - show any connection problem on the page
 today = dt.date.today()
 names = [str(n).strip() for n in team["name"]]
 loaded_at = dt.datetime.now().strftime("%H:%M")
+TEAM_OF = dict(zip(names, team["team"]))
+TEAMS = list(dict.fromkeys(t for t in team["team"] if t))             # in the teams' own order
 
 ME = None                                              # a user's own name; None for managers and the admin
 if not SEE_ALL:
@@ -2322,6 +2350,12 @@ if not SEE_ALL:
     tickets = where(tickets, tickets["assignee"] == ME)
     names = [ME]
 
+# The Daily module views (Team pulse, Metrics, Excel) list only people who have deliverables:
+# everyone else is in the users table for sign-in, teams and tickets.
+_in_module = set(items["owner"])
+MODULE_TEAM = where(team, [n in _in_module for n in team["name"]]) if SEE_ALL else team
+MODULE_NAMES = [str(n).strip() for n in MODULE_TEAM["name"]]
+
 _tab_names = ((["Team pulse", "Tickets", "Ticket health", "Metrics"] + (["Manage"] if IS_ADMIN else []) + ["Excel"])
               if SEE_ALL else ["My work", "My tickets", "My metrics"])
 _tabs = dict(zip(_tab_names, st.tabs(_tab_names)))
@@ -2332,14 +2366,23 @@ tab_health, tab_admin, tab_excel = _tabs.get("Ticket health"), _tabs.get("Manage
 
 with tab_pulse:
     # Filter row: people and a due-date range. Empty = everyone / all dates.
-    f1, f2, f3, f4 = st.columns([2, 1, 1, 1.1])
-    sel = f1.multiselect("People", names, default=[], placeholder="Everyone", key="p_people") if SEE_ALL else []
+    if SEE_ALL:
+        f0, f1, f2, f3, f4 = st.columns([1.3, 1.7, 1, 1, 1.1])
+        teams_here = list(dict.fromkeys(TEAM_OF[n] for n in MODULE_NAMES if TEAM_OF.get(n)))
+        sel_team = f0.multiselect("Team", teams_here, default=[], placeholder="All teams", key="p_team")
+        pool = [n for n in MODULE_NAMES if not sel_team or TEAM_OF.get(n) in sel_team]
+        if "p_people" in st.session_state:       # drop people the team choice no longer offers
+            st.session_state["p_people"] = [n for n in st.session_state["p_people"] if n in pool]
+        sel = f1.multiselect("People", pool, placeholder="Everyone", key="p_people")
+    else:
+        f2, f3, f4 = st.columns([1, 1, 1.1])
+        pool, sel = names, []
     due_from = f2.date_input("Due from", value=None, format="DD/MM/YYYY", key="p_from")
     due_to = f3.date_input("Due to", value=None, format="DD/MM/YYYY", key="p_to")
     work = MODES[f4.selectbox("Work", ["All work", "Discussed only", "Extras only"], key="p_work",
                               help="Discussed only = what was committed at the stand-up. Extras = tasks added afterwards.")]
 
-    chosen = sel or names
+    chosen = sel or pool
     team_f = where(team, [n in chosen for n in names])
     mask = [o in chosen for o in items["owner"]]
     if due_from or due_to:
@@ -2367,10 +2410,18 @@ with tab_tickets:
     tickets = tickets.copy()
     tickets["age"] = [((r if is_date(r) else report_date) - c).days if is_date(c) else 0
                       for c, r in zip(tickets["created"], tickets["resolved"])]
-    team_only = SEE_ALL and st.toggle("Only tickets assigned to the team", value=True, key="t_team",
-                          help="Off = also tickets once handled by the team but now assigned to someone else")
+    tickets["team"] = [TEAM_OF.get(a, "") for a in tickets["assignee"]]
+    if SEE_ALL:
+        k1, k2 = st.columns([2, 3])
+        team_only = k1.toggle("Only tickets assigned to the team", value=True, key="t_team",
+                              help="Off = also tickets once handled by the team but now assigned to someone else")
+        t_teams = k2.multiselect("Team", TEAMS, default=[], placeholder="All teams", key="t_teams")
+    else:
+        team_only, t_teams = False, []
     if team_only:
         tickets = where(tickets, tickets["on_team"])
+    if t_teams:
+        tickets = where(tickets, tickets["team"].isin(t_teams))
 
     def opts(col: str) -> list[str]:
         return sorted(tickets[col].unique().tolist())
@@ -2412,9 +2463,9 @@ with tab_tickets:
     show = sel_t.sort_values(by=order[0], ascending=order[1])
     st.markdown(CSS + tickets_table(show, JIRA), unsafe_allow_html=True)
 
-    csv = show[["number", "key", "state", "jira_status", "priority", "summary", "assignee", "created", "age"]].rename(columns={
+    csv = show[["number", "key", "state", "jira_status", "priority", "summary", "assignee", "team", "created", "age"]].rename(columns={
         "number": "No.", "key": "Key", "state": "State", "jira_status": "Status", "priority": "Priority", "summary": "Summary",
-        "assignee": "Assignee", "created": "Created", "age": "Age (days)",
+        "assignee": "Assignee", "team": "Team", "created": "Created", "age": "Age (days)",
     })
     c1, c2, c3 = st.columns([3, 1, 1])
     _ls = last_sync_at()
@@ -2437,7 +2488,7 @@ def excel_tab() -> None:
     st.markdown("**Export**", unsafe_allow_html=True)
     st.caption("One sheet per person, same columns as Daily module.xlsx (id, #deliverable, discussion_date, due date, Comment) plus ticket and status.")
     st.download_button(
-        "Download deliverables as Excel", export_workbook(items, team),
+        "Download deliverables as Excel", export_workbook(items, MODULE_TEAM),
         file_name=f"Daily module {today:%Y-%m-%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="x_dl",
     )
@@ -2580,7 +2631,7 @@ with tab_admin:
     ticket_ids = [int(x) for x in tickets["number"].tolist()]
     lookups = {"users": name_to_id, "assignee": {**name_to_id, "Unassigned": None}}
 
-    which = st.radio("Table", ["Deliverables", "Tickets", "Users"], horizontal=True, key="admin_table")
+    which = st.radio("Table", ["Deliverables", "Tickets", "Users", "Teams"], horizontal=True, key="admin_table")
 
     if which == "Deliverables":
         df = query("""
@@ -2660,5 +2711,39 @@ with tab_admin:
                 "active": st.column_config.CheckboxColumn("Active", default=True),
             },
         }
-        editor(spec, users_all, lookups, "ed_users")
-        st.caption("Tip: untick Active instead of deleting a person who still has deliverables or tickets.")
+        users_ed = users_all
+        try:
+            teams_df = query("select team_id, name from teams order by coalesce(sort_order, 999), name")
+            users_ed = query("""select u.user_id, u.full_name, u.initials, t.name as team, u.active
+                                from users u left join teams t on t.team_id = u.team_id order by u.user_id""")
+            users_ed["active"] = users_ed["active"].astype(bool)
+            lookups["teams"] = {str(n): int(i) for i, n in zip(teams_df["team_id"], teams_df["name"])}
+            spec["kinds"]["team"] = "text"
+            spec["to_db"] = {"team": ("team_id", "teams")}
+            spec["config"]["team"] = st.column_config.SelectboxColumn("Team", options=list(lookups["teams"]))
+        except Exception:  # noqa: BLE001 - before supabase_teams.sql: no Team column
+            st.caption("Run supabase_teams.sql in Supabase to give everyone a team.")
+        editor(spec, users_ed, lookups, "ed_users")
+        st.caption("Tip: untick Active instead of deleting a person who still has deliverables or tickets. "
+                   "A new person signs in after a [users.<username>] block with their full name is added to the app secrets.")
+
+    elif which == "Teams":
+        try:
+            teams_df = query("select team_id, name, sort_order from teams order by coalesce(sort_order, 999), name")
+        except Exception:  # noqa: BLE001
+            st.info("Run supabase_teams.sql in Supabase first.")
+        else:
+            teams_df["sort_order"] = pd.to_numeric(teams_df["sort_order"], errors="coerce")
+            spec = {
+                "table": "teams", "pk": "team_id",
+                "required": ["name"],
+                "kinds": {"team_id": "int", "name": "text", "sort_order": "int"},
+                "disabled": ["team_id"],
+                "config": {
+                    "team_id": st.column_config.NumberColumn("ID", width="small"),
+                    "name": st.column_config.TextColumn("Team", required=True),
+                    "sort_order": st.column_config.NumberColumn("Order", min_value=0, step=1, help="Teams are listed in this order"),
+                },
+            }
+            editor(spec, teams_df, lookups, "ed_teams")
+            st.caption("To move a person to another team, change Team on the Users table.")

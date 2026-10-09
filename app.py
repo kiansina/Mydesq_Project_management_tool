@@ -2198,13 +2198,12 @@ def health_tab() -> None:
 # ----------------------------------------------------------------------------
 ROLES = ("admin", "manager", "user")
 MAX_TRIES, LOCK_MINUTES = 5, 15
-MIN_PASSWORD = 10
 EXAMPLE_PASSWORD = "choose-a-long-password"          # printed in secrets.toml.example in the public repo
 
 
 def usable_password(pw: str) -> bool:
-    """The example password and short ones never open the app (the repo, and so the example, is public)."""
-    return len(pw) >= MIN_PASSWORD and EXAMPLE_PASSWORD not in pw.lower()
+    """Any password except the example one, which is public because the repo is."""
+    return bool(pw) and EXAMPLE_PASSWORD not in pw.lower()
 
 
 def accounts() -> dict[str, dict]:
@@ -2266,7 +2265,7 @@ def sign_in() -> dict:
     st.markdown("#### Daily module")
     if not accts:
         st.warning("Sign-in is not set up yet. Add one [users.<username>] block per person to the app secrets, "
-                   f"with password (at least {MIN_PASSWORD} characters, not the example one), role and name "
+                   "with password (not the example one), role and name "
                    "(see secrets.toml.example).")
         st.stop()
     with st.form("sign_in"):

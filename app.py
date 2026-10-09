@@ -1864,13 +1864,18 @@ def _month_label(m: pd.Period, today: dt.date) -> str:
 @st.cache_resource(ttl=3600, show_spinner="Working out ticket health from the Jira history...")
 def health_model(sync_key: str) -> dict | None:
     """Rebuilt once per sync (sync_key changes when new data arrives). Returns None before the Jira tables exist."""
+    # The sync stores every MYDSUP ticket; Ticket health looks at the tickets people linked to Jira handle:
+    # assigned to one of them now, or ever handed to or from one of them.
+    scope = """select t.ticket_id from tickets t where t.jira_key is not null and (t.assignee_id is not null or exists (
+                   select 1 from jira_events e where e.ticket_id = t.ticket_id and e.field = 'assignee'
+                   and (e.to_user_id is not null or e.from_user_id is not null)))"""
     try:
-        tks = query("""select ticket_id, jira_key, summary, issue_type, priority, jira_status, resolution, created_at,
-                              assignee_id, assignee_name from tickets where jira_key is not null""")
-        events = query("""select ticket_id, history_id, item_no, at, author_type, field, from_value, to_value, from_user_id, to_user_id
-                          from jira_events where field in ('status', 'assignee')""")
-        comments = query("select ticket_id, created_at, author_type, is_public from jira_comments where author_type = 'team'")
-        sla = query("select ticket_id, cycle, ongoing, breached, goal_ms, elapsed_ms from jira_sla where sla = 'first_response'")
+        tks = query(f"""select ticket_id, jira_key, summary, issue_type, priority, jira_status, resolution, created_at,
+                               assignee_id, assignee_name from tickets where ticket_id in ({scope})""")
+        events = query(f"""select ticket_id, history_id, item_no, at, author_type, field, from_value, to_value, from_user_id, to_user_id
+                           from jira_events where field in ('status', 'assignee') and ticket_id in ({scope})""")
+        comments = query(f"select ticket_id, created_at, author_type, is_public from jira_comments where author_type = 'team' and ticket_id in ({scope})")
+        sla = query(f"select ticket_id, cycle, ongoing, breached, goal_ms, elapsed_ms from jira_sla where sla = 'first_response' and ticket_id in ({scope})")
         smap = query("select * from jira_status_map")
         people = query("select user_id, full_name, initials from users where jira_account_id is not null order by user_id")
     except Exception as e:  # noqa: BLE001
@@ -2194,11 +2199,11 @@ def health_tab() -> None:
         st.warning("The last Jira sync stored no tickets for the team, so there is nothing to measure yet.")
         st.markdown(
             f"- Last sync: **{summ.get('mode', '?')}**, **{summ.get('tickets', '?')}** tickets, at {last.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}\n"
-            f"- Team members linked to Jira: **{d.get('linked_people')}** (expected 5)\n"
+            f"- People linked to a Jira account: **{d.get('linked_people')}**\n"
             f"- Tickets with Jira data in the database: **{d.get('synced_tickets')}**\n"
             f"- Status map rows: **{d.get('statuses')}** (expected 9)")
         if d.get("linked_people") in (0, None) or str(d.get("linked_people")).startswith("error"):
-            st.caption("Nobody is linked to a Jira account: run supabase_jira_sync.sql (section 1 links the five people), then Full re-sync.")
+            st.caption("Nobody is linked to a Jira account: run supabase_jira_sync.sql and supabase_jira_people.sql, then Full re-sync.")
         else:
             st.caption("Most likely the Jira account in the Streamlit secrets cannot see the team's MYDSUP tickets. "
                        "Sign in on Manage, open Jira sync and press Check connection: it shows which account is used and what it can see.")
@@ -2580,7 +2585,8 @@ with tab_admin:
         else:
             j1, j2, j3 = st.columns(3)
             mode = "incremental" if j1.button("Sync changes now", key="jira_inc", width="stretch") else (
-                "full" if j2.button("Full re-sync (about 3 minutes)", key="jira_full", width="stretch") else None)
+                "full" if j2.button("Full re-sync (10-15 minutes)", key="jira_full", width="stretch",
+                                    help="Every MYDSUP ticket. Keep this tab open until it finishes.") else None)
             if j3.button("Check connection", key="jira_check", width="stretch",
                          help="Read-only: shows which Jira account the secrets use and how many team tickets it can see"):
                 try:

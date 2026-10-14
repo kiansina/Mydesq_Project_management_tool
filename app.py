@@ -701,21 +701,22 @@ HEALTH_PERSON_TIP = ("A label appears from 10 settled tickets. Compared only wit
                      "predict for the same mix of ticket types. Amber means worth a look together, never a judgement.")
 
 
-def period_menu(today: dt.date, first_year: int = 2025) -> list[tuple[str, list[pd.Period]]]:
-    """Calendar periods, newest first: everything, each year, each quarter, each month."""
+def period_menu(today: dt.date, first_year: int = 2025) -> dict[str, list[tuple[str, list[pd.Period]]]]:
+    """Calendar periods by kind (All, Year, Quarter, Month), newest first."""
     cur = pd.Timestamp(today).to_period("M")
     allm = list(pd.period_range(f"{first_year}-01", cur, freq="M"))
     so_far = lambda ms: " (so far)" if cur in ms else ""  # noqa: E731
-    out = [(f"All since January {first_year}", allm)]
     years = sorted({m.year for m in allm}, reverse=True)
-    out += [(f"{y}{so_far([m for m in allm if m.year == y])}", [m for m in allm if m.year == y]) for y in years]
+    quarters = []
     for y in years:
         for q in (4, 3, 2, 1):
             ms = [m for m in allm if m.year == y and (m.month - 1) // 3 + 1 == q]
             if ms:
-                out.append((f"Q{q} {y}{so_far(ms)}", ms))
-    out += [(m.strftime("%B %Y") + so_far([m]), [m]) for m in reversed(allm)]
-    return out
+                quarters.append((f"Q{q} {y}{so_far(ms)}", ms))
+    return {"All": [(f"All since January {first_year}", allm)],
+            "Year": [(f"{y}{so_far([m for m in allm if m.year == y])}", [m for m in allm if m.year == y]) for y in years],
+            "Quarter": quarters,
+            "Month": [(m.strftime("%B %Y") + so_far([m]), [m]) for m in reversed(allm)]}
 
 
 def _load_holidays() -> None:
@@ -1104,10 +1105,16 @@ def health_tab() -> None:
                        "Sign in on Manage, open Jira sync and press Check connection: it shows which account is used and what it can see.")
         return
     menu = period_menu(today)
-    c1, c2 = st.columns([1.2, 2])
-    label = c1.selectbox("Period", [m for m, _ in menu], index=1, key="h_period")
-    months = dict(menu)[label]
-    sel_team = c2.multiselect("Team", TEAMS, placeholder="All teams", key="h_team")
+    kind = st.segmented_control("Period", list(menu), default="Year", key="h_kind") or "Year"
+    c2, c3 = st.columns([1, 1.6])
+    choices = menu[kind]
+    if len(choices) == 1:
+        label, months = choices[0]
+        c2.text_input(kind, label, disabled=True, key="h_all")
+    else:
+        label = c2.selectbox(kind, [c for c, _ in choices], key=f"h_{kind.lower()}")
+        months = dict(choices)[label]
+    sel_team = c3.multiselect("Team", TEAMS, placeholder="All teams", key="h_team")
     linked = query("select user_id, full_name, jira_account_id from users where jira_account_id is not null")
     linked["full_name"] = linked["full_name"].astype(str).str.strip()
     if sel_team:

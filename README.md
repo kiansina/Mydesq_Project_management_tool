@@ -31,7 +31,7 @@ in `secrets.toml` on the server; the browser never sees it.
 
     pip install -r requirements.txt
     copy secrets.toml.example .streamlit\secrets.toml
-    notepad .streamlit\secrets.toml        # paste the URI, choose an admin password
+    notepad .streamlit\secrets.toml        # paste the URI, add the sign-in accounts
     streamlit run app.py
 
 `secrets.toml` needs (prefix `postgresql+psycopg2://` instead of `postgresql://`; the separate
@@ -41,8 +41,10 @@ in `secrets.toml` on the server; the browser never sees it.
     [connections.supabase]
     url = "postgresql+psycopg2://postgres.abcdefghijkl:PASSWORD@aws-0-eu-central-1.pooler.supabase.com:5432/postgres"
 
-    [admin]
+    [users.sina]
     password = "choose-a-long-password"
+    role = "admin"
+    name = "Sina Kian"
 
     [app]
     snapshot_date = "2026-09-25"
@@ -74,10 +76,29 @@ Put the secrets in `.streamlit/secrets.toml` next to `app.py` (or set them as
 environment variables, e.g. `STREAMLIT_CONNECTIONS_SUPABASE_URL`). Pin the URL in
 Teams; a Website tab needs https, so put IIS or nginx with a certificate in front.
 
-## 5. The Manage tab
+## 5. Sign-in, roles and the Manage tab
 
-* Opens with the password from `[admin] password`. That is a shared secret meant for
-  the manager; the session stays signed in until Sign out or a page reload.
+Everyone signs in with a username and password from the app secrets, one block per person
+(see `secrets.toml.example`):
+
+    [users.anjali]
+    password = "choose-a-long-password"
+    role = "user"
+    name = "Anjali Mishra"
+
+* **admin** sees everything and can change data: Manage tab, Excel import, Jira sync.
+* **manager** sees every tab read-only, including per-person metrics and the weekly report.
+* **user** sees only their own work: My work, My tickets and My metrics. `name` must be the
+  full name as in the users table.
+* After 5 wrong passwords a username is locked for 15 minutes. Removing a block or changing
+  its password signs that person out at their next click. Reloading the page asks to sign in again.
+
+Teams: run `supabase_teams.sql` once in the Supabase SQL Editor. It creates the teams, adds everyone
+from the team chart and puts each person in one team. Team pulse and Tickets then get a Team filter, and
+names carry a small team label. Team pulse, Metrics and the Excel export list only people with deliverables.
+
+The Manage tab (admin only, with Users and Teams tables):
+
 * Pick a table, edit cells in place, add rows at the bottom, tick rows to delete,
   then **Save**. Each save runs the inserts/updates/deletes inside one transaction;
   if the database rejects something (for example deleting a user who still owns
@@ -88,93 +109,43 @@ Teams; a Website tab needs https, so put IIS or nginx with a certificate in fron
 To replace the password with real single sign-on later, Streamlit supports
 `st.login()` with Microsoft Entra ID (see Streamlit docs, "Authentication").
 
-## 6. The Excel tab
+## 6. Deliverables (projects)
 
-* **Download deliverables as Excel** gives the same layout as `Daily module.xlsx`: one
-  sheet per person with `id`, `#deliverable`, `discussion_date`, `due date`, `Comment`,
-  plus `ticket` and `status`. Anyone can download.
-* **Import** (after signing in on the Manage tab): upload a workbook in that layout.
-  The app shows every row it found, who it belongs to (sheet name = first name), the
-  dates and ticket it recognised, and a Problem column for rows it will skip
-  (unknown sheet, no discussion date, ticket not in the tickets table, row already in
-  the database). Press **Insert** to add the clean rows.
-* Ticket numbers inside the text (`MYDSUP-15908`, `ticket 15384`) are linked; if the
-  cell is only a ticket number, the ticket's summary becomes the deliverable text.
-  `(Priority 2)` and free-text due dates such as `?` go into notes.
-* Tick the day/month swap box if Excel turned `11/09` into 9 November: cells stored as
-  real dates then get day and month swapped in the preview before you insert.
+Run `supabase_projects.sql` in the Supabase SQL Editor before deploying (part A is a check, part B creates the
+`projects` table, its rules and copies every old deliverable; part C, later, retires the old table). Optionally run
+`supabase_projects_selftest.sql`: it tries every rule and undoes everything.
 
-## 7. The Metrics tab
+* A project has three dates: created (set by the database), start and due. **The due date is final.** A late project
+  shows `+N d` and is never re-dated.
+* A person can add projects, close them (always today) and link a ticket once. Nothing else can change.
+  The database refuses anything else, whatever the screen sends.
+* The admin edits, cancels or deletes in Manage > Projects. Cancelled projects never count.
+* **My projects**: open, overdue, kept % and closed late, plus a start-to-due timeline (red tail = days past due).
+* **Team** (managers and admin): the same tiles, Keeping commitments (one square per closed or past-due project),
+  On their plate (open projects next to open tickets), Due by week, the overdue list and an Excel download.
+* Kept = closed on or before the due date. Labels start at 4 settled projects: 80% or more kept is good;
+  under 60% with at least 3 not kept needs support.
 
-Needs the database upgrade first: run `supabase_metrics_upgrade.sql` once in the
-Supabase SQL Editor, then deploy the new `app.py`.
+## 7. Jira sync and Ticket health
 
-Visible to everyone:
-
-* **Team metrics**: total, completed, on-time rate, delayed, date never moved, cycle time, extra tasks.
-* **Workload**: open deliverables per person by week of due date, with planned days.
-* **Blocked items**: owner, reason, first due date and delay.
-
-After signing in on the Manage tab:
-
-* **Keeping commitments**: one small square per commitment that has come due, counted from
-  the first due date. Solid green = kept, solid amber = delivered late, hollow red = still open
-  past the first due date. Each row prints "7 of 9 kept" and a calm label (Keeps commitments,
-  Some dates slip, Needs support, Too early to tell). Labels start at 4 settled commitments:
-  80% or more kept is good; under 60% with at least 3 not kept needs support.
-* **On their plate**: open work now, one bar per person on a shared scale: past first due
-  date, needs a date, on schedule, extra task. It ignores the Measure switch on purpose.
-* **Look at one person**: Needs attention, Coming up and Delivered lists for the chosen person.
-* **All numbers per person**: the sixteen metrics, in a collapsed section.
-* **Weekly report**: Excel workbook with Summary, People, Done this week, Delayed,
-  Due next 7 days, Blocked and No date.
-
-New columns on `deliverables`, all editable in the Manage grid except the first:
-
-| column | meaning |
-|---|---|
-| `original_due_date` | first date promised; set automatically, never changes ("Date never moved" counts how often it still equals the due date) |
-| `blocked_reason` | why an item is Blocked; cleared when the status changes |
-| `planned_days` | rough effort in working days |
-
-Delay is always counted from the first due date, so moving a date does not hide a delay.
-
-## 8. Extra tasks
-
-Run `supabase_extra_flag.sql` once, then deploy `app.py`.
-
-An extra task is work added after the stand-up. It is stored as a normal deliverable
-with `is_extra = true`: tick **Extra** in the Manage grid, put `yes` in the `extra`
-column of an Excel import, or tick "Mark every row in this file as an extra task".
-
-* **Metrics tab**: the Measure switch (Discussed only, All work, Extras only) decides
-  which work the on-time rate, delays, verdicts and charts cover. It starts on Planned
-  only. The Extras count per person is always shown, whatever the switch says.
-* **Team pulse**: a Work filter (All work, Discussed only, Extras only), starting on
-  All work, and a purple "extra" tag on those rows. Each person is a card with their
-  own color and counts. The row details say whether a task was planned or extra.
-* **Weekly report**: an Extra column on every list, an "Extra tasks" sheet, and the
-  Summary states which work the performance numbers cover.
-* **Excel export**: an `extra` column (`yes` or empty).
-
-## 9. Jira sync and Ticket health
-
-The team's MYDSUP tickets (everything ever assigned to the five team members with a Jira
-account) are copied from Jira into Supabase. **Read-only**: `jira_client.py` refuses any request
-to Jira other than reads and searches, so this code cannot change a ticket.
+Every MYDSUP ticket is copied from Jira into Supabase: tickets updated since the start of the
+previous year with their history, older ones as rows only. People linked to a Jira account
+(`users.jira_account_id`) are credited with their tickets and changes. **Read-only**: `jira_client.py`
+refuses any request to Jira other than reads and searches, so this code cannot change a ticket.
 
 Files: `jira_client.py`, `jira_sync.py`, `ticket_kpis.py`, `supabase_jira_sync.sql`,
-`.github/workflows/jira-sync.yml`.
+`supabase_jira_people.sql`, `.github/workflows/jira-sync.yml`.
 
 ### One-time setup (no GitHub secrets needed)
 
-1. Supabase SQL Editor: run `supabase_jira_sync.sql`. The last query should show 5 linked people,
-   9 statuses (3 delivered) and 33 holidays.
+1. Supabase SQL Editor: run `supabase_jira_sync.sql` (the last query shows 9 statuses, 3 delivered,
+   and 33 holidays), then `supabase_teams.sql`, then `supabase_jira_people.sql` (16 linked people).
 2. Streamlit Cloud > app > Settings > Secrets: add the `[jira]` block from `secrets.toml.example`
    (Jira login email and an API token from id.atlassian.com > Security > API tokens) and
    `jira_base_url` under `[app]`. Streamlit secrets are private to the app, also for a public repository.
 3. Push the app files (not the `.github` folder, see below).
-4. Open the app, sign in on Manage, open **Jira sync** and press **Full re-sync** once (about 3 minutes).
+4. Sign in as admin, open Manage > **Jira sync** and press **Full re-sync** once (10-15 minutes;
+   keep the tab open until it finishes).
 
 ### How it stays current
 

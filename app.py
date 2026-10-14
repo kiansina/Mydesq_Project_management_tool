@@ -23,7 +23,9 @@ import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+import charts as CH
 import deliverables as DL
+import ticket_flow as TF
 import ticket_kpis as KPI
 
 PRIORITIES = ["Critical", "High", "Medium", "Low"]          # Jira's priority names
@@ -236,8 +238,8 @@ def ticket_lines(sync_key: str) -> dict[int, str]:
     try:
         t = query("""select ticket_id, created_at, jira_status, assignee_account, taken_by_account, closed_by_account, closed_by_type
                      from tickets where jira_key is not null""")
-        ev = query("""select ticket_id, history_id, item_no, at, field, from_value, to_value, from_account, to_account
-                      from jira_events where field in ('status', 'assignee')""")
+        ev = KPI.drop_bulk(query("""select ticket_id, history_id, item_no, at, field, from_value, to_value, from_account, to_account,
+                                          author_account from jira_events where field in ('status', 'assignee')"""))
         staff = query("select account_id, display_name from jira_people")
         linked = query("select jira_account_id, full_name from users where jira_account_id is not null")
         smap = query("select status, side from jira_status_map")
@@ -693,42 +695,47 @@ HEALTH_CSS = """
 @media (max-width:640px){.dm .trends{grid-template-columns:1fr}}
 </style>
 """
-HEALTH_HELP = """
-**How these are measured.** Everything comes from the Jira history, read-only. Business hours are Monday to Friday, 09:00 to 18:00 Rome time, minus the holidays table.
-
-- **Answered in time.** Jira's own *Time to first response* timer, first cycle, for tickets created in the month whose first assignee was on the team. This is a team-level number only, because the first reply is a shared inbox duty.
-- **Stayed fixed.** One square per ticket, at its first delivery into *Client Feedback* or *Closed*.
-  - *Came back* means it went back to an open status within 30 days.
-  - Going back and being re-delivered within 4 business hours, only through Open, Under Review or Inbox, is a quick follow-up and does not count.
-  - *Held* means 30 days passed, or the ticket reached Closed, without coming back.
-  - It is credited to the ticket's main owner, the team member who held it longest on our side.
-- **Time on our side.** Business hours in *Open* or *Under Review* with a team member assigned, from creation to first delivery. Waiting for the client, the bank, a release, another team or triage is never counted.
-  - *Within usual* compares that time with the team's level in the baseline year (the previous calendar year, 2025 at the start) for the same ticket type (80th percentile).
-- **Where the time goes.** The same business hours, split by whose side the ball was on. The side of each status comes from the `jira_status_map` table.
-- **Whose move is it?** Open tickets right now, counted as Jira counts them: no resolution yet.
-- **Could use a nudge.** Open tickets with no team comment or change:
-  - on our side: 0.5 business days (Critical), 1 (High) or 3 (Medium/Low);
-  - triage: 1 day;
-  - client: 5 days without a public update;
-  - bank: 5 days;
-  - release: 15 days.
-- **Person labels (manager only).** A person gets a label only from 10 settled tickets, and is compared only with what the team's 2025 results predict for the same mix of ticket types, never with colleagues. A label is a reason to look at the tickets together, not a judgement.
-
-Jira's *Time to resolution* timer is not used, because in this project it keeps running after tickets close.
-"""
 
 
 HEALTH_PERSON_TIP = ("A label appears from 10 settled tickets. Compared only with what the team's baseline-year results "
                      "predict for the same mix of ticket types. Amber means worth a look together, never a judgement.")
 
 
-def _months_menu(today: dt.date, first_year: int = 2025) -> list[pd.Period]:
+def period_menu(today: dt.date, first_year: int = 2025) -> list[tuple[str, list[pd.Period]]]:
+    """Calendar periods, newest first: everything, each year, each quarter, each month."""
     cur = pd.Timestamp(today).to_period("M")
-    return list(pd.period_range(f"{first_year}-01", cur, freq="M"))[::-1]
+    allm = list(pd.period_range(f"{first_year}-01", cur, freq="M"))
+    so_far = lambda ms: " (so far)" if cur in ms else ""  # noqa: E731
+    out = [(f"All since January {first_year}", allm)]
+    years = sorted({m.year for m in allm}, reverse=True)
+    out += [(f"{y}{so_far([m for m in allm if m.year == y])}", [m for m in allm if m.year == y]) for y in years]
+    for y in years:
+        for q in (4, 3, 2, 1):
+            ms = [m for m in allm if m.year == y and (m.month - 1) // 3 + 1 == q]
+            if ms:
+                out.append((f"Q{q} {y}{so_far(ms)}", ms))
+    out += [(m.strftime("%B %Y") + so_far([m]), [m]) for m in reversed(allm)]
+    return out
 
 
-def _month_label(m: pd.Period, today: dt.date) -> str:
-    return m.strftime("%B %Y") + (" (so far)" if m == pd.Timestamp(today).to_period("M") else "")
+def _load_holidays() -> None:
+    try:
+        KPI.HOLIDAYS = {pd.Timestamp(d).date() for d in query("select day from holidays")["day"]}
+    except Exception:  # noqa: BLE001 - holidays table is optional
+        pass
+
+
+@st.cache_resource(ttl=3600, show_spinner=False)
+def flow_model(sync_key: str) -> dict | None:
+    """Who received, resolved and holds which ticket (ticket_flow.py); rebuilt once per sync."""
+    try:
+        t = query("select ticket_id, created_at, resolved_at, resolution, assignee_account, closed_assignee_account "
+                  "from tickets where jira_key is not null")
+        e = query("select ticket_id, at, history_id, item_no, field, from_account, to_account from jira_events where field = 'assignee'")
+    except Exception:  # noqa: BLE001 - before supabase_ticket_people.sql
+        return None
+    _load_holidays()
+    return TF.build(t, e, pd.Timestamp(sync_key).tz_convert("UTC").to_pydatetime())
 
 
 @st.cache_resource(ttl=3600, show_spinner="Working out ticket health from the Jira history...")
@@ -743,8 +750,13 @@ def health_model(sync_key: str) -> dict | None:
     try:
         tks = query(f"""select ticket_id, jira_key, summary, issue_type, priority, jira_status, resolution, created_at,
                                assignee_id, assignee_name from tickets where ticket_id in ({scope})""")
-        events = query(f"""select ticket_id, history_id, item_no, at, author_type, field, from_value, to_value, from_user_id, to_user_id
-                           from jira_events where field in ('status', 'assignee') and ticket_id in ({scope})""")
+        try:
+            events = KPI.drop_bulk(query(f"""select ticket_id, history_id, item_no, at, author_type, field, from_value, to_value, from_user_id,
+                                                   to_user_id, author_account
+                                            from jira_events where field in ('status', 'assignee') and ticket_id in ({scope})"""))
+        except Exception:  # noqa: BLE001 - before supabase_ticket_people.sql: no author_account, nothing to filter by
+            events = query(f"""select ticket_id, history_id, item_no, at, author_type, field, from_value, to_value, from_user_id, to_user_id
+                               from jira_events where field in ('status', 'assignee') and ticket_id in ({scope})""")
         comments = query(f"select ticket_id, created_at, author_type, is_public from jira_comments where author_type = 'team' and ticket_id in ({scope})")
         sla = query(f"select ticket_id, cycle, ongoing, breached, goal_ms, elapsed_ms from jira_sla where sla = 'first_response' and ticket_id in ({scope})")
         smap = query("select * from jira_status_map")
@@ -756,11 +768,7 @@ def health_model(sync_key: str) -> dict | None:
         raise                    # anything else: not cached, shown to the user, retried next time
     if tks.empty:
         return {"problem": "empty"}
-    try:
-        hol = query("select day from holidays")
-        KPI.HOLIDAYS = {pd.Timestamp(d).date() for d in hol["day"]}
-    except Exception:  # noqa: BLE001 - holidays table is optional
-        pass
+    _load_holidays()
     try:
         rep = query("select ticket_id, reporter_type from tickets where jira_key is not null and reporter_type is not null")
         reporter = {int(r.ticket_id): str(r.reporter_type) for r in rep.itertuples()}
@@ -796,7 +804,13 @@ def _tile(label: str, value: str, sub: str, year: str, kind: str, chip_text: str
 
 
 def _squares(items: list[tuple[str, str]], small: bool) -> str:
-    """items: (class, tooltip) in display order; a gap is inserted where the class changes."""
+    """items: (class, tooltip) in display order; a gap is inserted where the class changes. Over 80: one bar of counts."""
+    if len(items) > 80:
+        counts = {}
+        for cls, _ in items:
+            counts[cls] = counts.get(cls, 0) + 1
+        return ('<div class="lbar" style="width:100%">' + "".join(f'<i class="{c}" style="flex:{n} 1 0" title="{n}"></i>' for c, n in counts.items())
+                + '</div>')
     out, prev = [], None
     for cls, tip in items:
         gap = " gap" if prev is not None and cls != prev else ""
@@ -819,20 +833,29 @@ def _trend(values: list[tuple[pd.Period, float | None, int]], base: float | None
             + "".join(f'<span>{m.strftime("%b")[0]}</span>' for m, _, _ in values) + '</div>')
 
 
-def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, people_on: bool, sync_label: str) -> str:
+def render_health(model: dict, label: str, months: list[pd.Period], today: dt.date, admin: bool, people_on: bool, sync_label: str,
+                  ids: set[int] | None = None) -> tuple[str, str]:
+    """The tiles (first part) and everything below the Assigned and resolved section (second part).
+    ids: the user ids of the chosen teams, or None for everyone linked to Jira."""
     tk, s, base, now = model["tk"], model["scored"], model["base"], model["now"]
-    team_ids = model["team_ids"]
+    team_ids = model["team_ids"] if ids is None else ids
+    people_rows = [p for p in model["people"] if ids is None or p[0] in ids]
+    if ids is not None:
+        s = s[s["main_owner"].isin(ids)]
+        sub = {k: t for k, t in tk.items() if t.holder_now in ids}
+        model = {**model, "nudges": KPI.nudges(sub, now), "move": KPI.whose_move(sub, now), "people": people_rows}
     names = {uid: n for uid, n, _ in model["people"]}
     cur = pd.Timestamp(today).to_period("M")
-    year_months = set(pd.period_range(f"{month.year}-01", month, freq="M"))
-    sm = s[s["month"] == month]
+    end = max(months)
+    year_months = set(pd.period_range(f"{end.year}-01", end, freq="M"))
+    sm = s[s["month"].isin(months)]
     sy = s[s["month"].isin(year_months)]
 
     h = ['<div class="dm">']
-    h.append(f'<div class="top"><span class="h1">Ticket health</span><span class="muted">{esc(_month_label(month, today))} &middot; {esc(sync_label)}</span></div>')
+    h.append(f'<div class="top"><span class="h1">Ticket health</span><span class="muted">{esc(label)} &middot; {esc(sync_label)}</span></div>')
 
     # tiles
-    a_m = KPI.answered_in_time(tk, model["sla"], model["reporter"], team_ids, {month})
+    a_m = KPI.answered_in_time(tk, model["sla"], model["reporter"], team_ids, set(months))
     a_y = KPI.answered_in_time(tk, model["sla"], model["reporter"], team_ids, year_months)
     a_kind = KPI.chip_level(a_m["pct"], a_m["n"], 90, 80)
     a_val = f'{a_m["pct"]}%' if a_m["n"] >= KPI.TEAM_PCT_MIN else (f'{a_m["on"]} of {a_m["n"]}' if a_m["n"] else "&mdash;")
@@ -852,15 +875,15 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
     w_pct = round(100 * sm["within_team"].mean()) if len(sm) else None
     t_kind = KPI.chip_level(w_pct, len(sm), 80, 70)
     t_val = KPI.fmt_h(float(sm["ours_h"].median())) if len(sm) else "&mdash;"
-    t_sub = f"median on our side &middot; {w_pct}% within usual" if w_pct is not None else "no deliveries this month"
+    t_sub = f"median on our side &middot; {w_pct}% within usual" if w_pct is not None else "no deliveries in this period"
     nd = model["nudges"]
     n_kind = "good" if len(nd) == 0 else ("watch" if len(nd) <= 3 else "bad")
     h.append('<div class="kpis">')
     h.append(_tile("Answered in time", a_val, a_sub, f'this year {a_y["pct"]}%' if a_y["pct"] is not None else "this year &mdash;", a_kind,
                    {"good": "On track", "watch": "Watch", "bad": "Needs a look", "none": "Too few to tell"}[a_kind],
-                   "Jira first-response SLA, first cycle, tickets created in the month"))
+                   "Jira first-response SLA, first cycle, tickets created in the period"))
     h.append(_tile("Stayed fixed", s_val, s_sub, f'this year {st_y["pct"]}% &middot; {base.year}: {lvl:.0f}%' if st_y["pct"] is not None and lvl else "this year &mdash;",
-                   s_kind, s_chip, "First deliveries in the month: did they come back within 30 days?"))
+                   s_kind, s_chip, "First deliveries in the period: did they come back within 30 days?"))
     h.append(_tile("Time on our side", t_val, t_sub, f'this year {KPI.fmt_h(float(sy["ours_h"].median())) if len(sy) else "&mdash;"}', t_kind,
                    {"good": "Usual pace", "watch": "Watch", "bad": "Needs a look", "none": "Too few to tell"}[t_kind],
                    "Business hours in Open or Under Review with a team member, until first delivery"))
@@ -869,11 +892,12 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
     h.append('</div>')
     notes = []
     if a_m["no_sla"]:
-        notes.append(f'{a_m["no_sla"]} tickets created in the month have no Jira first-response target and are not counted.')
+        notes.append(f'{a_m["no_sla"]} tickets created in the period have no Jira first-response target and are not counted.')
     if not model["reporter"]:
         notes.append("Tickets raised by staff are included in Answered in time until the next sync adds the reporter type.")
     if notes:
         h.append('<p class="pnote">' + " ".join(notes) + '</p>')
+    split = len(h)                       # the Assigned and resolved section (charts) goes here
 
     # whose move is it
     mv = model["move"]
@@ -924,11 +948,11 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
     hours = sm[cols].sum() if len(sm) else pd.Series(0.0, index=cols)
     tot = float(hours.sum())
     h.append(f'<div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Where the time goes</span>'
-             f'<span class="muted">tickets first delivered in {month.strftime("%B")} &middot; {len(sm)}</span></div>')
+             f'<span class="muted">tickets first delivered in {esc(label)} &middot; {len(sm)}</span></div>')
     if len(sm) < 10:
-        h.append('<p class="sec" style="margin-top:8px">Too few tickets this month to show a split.</p>')
+        h.append('<p class="sec" style="margin-top:8px">Too few tickets in this period to show a split.</p>')
     elif tot <= 0:
-        h.append('<p class="sec" style="margin-top:8px">No business hours on mapped statuses this month. Check the jira_status_map table.</p>')
+        h.append('<p class="sec" style="margin-top:8px">No business hours on mapped statuses in this period. Check the jira_status_map table.</p>')
     else:
         h.append(_hbar([(f'{KPI.SIDE_LABEL[k[2:]]}: {100 * v / tot:.0f}%', float(v), KPI.SIDE_COLOR[k[2:]]) for k, v in hours.items()]))
         h.append('<div class="hleg">' + "".join(f'<span><span class="sw" style="background:{KPI.SIDE_COLOR[k[2:]]}"></span>{KPI.SIDE_LABEL[k[2:]]} <b>{100 * v / tot:.0f}%</b></span>'
@@ -958,9 +982,9 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
     h.append('</div>')
 
     # is it getting better?
-    months = list(pd.period_range(f"{month.year}-01", f"{month.year}-12", freq="M"))
+    tr_months = list(pd.period_range(f"{min(months).year}-01", f"{end.year}-12", freq="M"))[-24:]
     tr_a, tr_s, tr_w = [], [], []
-    for m in months:
+    for m in tr_months:
         if m > cur:
             tr_a.append((m, None, 0)); tr_s.append((m, None, 0)); tr_w.append((m, None, 0))
             continue
@@ -975,7 +999,7 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
     s25 = s[s["month"].isin(base_months)]
     w25 = 100 * s25["within_team"].mean() if len(s25) else None
     h.append(f'<div class="block"><div class="top" style="margin-bottom:0"><span class="h2">Is it getting better?</span>'
-             f'<span class="muted">{month.year} by month &middot; dashed line = {base.year} level &middot; faded = so far, outlined = under {KPI.TEAM_PCT_MIN} tickets</span></div><div class="trends">')
+             f'<span class="muted">by month &middot; dashed line = {base.year} level &middot; faded = so far, outlined = under {KPI.TEAM_PCT_MIN} tickets</span></div><div class="trends">')
     for label, vals, b in [("Answered in time", tr_a, a25), ("Stayed fixed", tr_s, lvl), ("Within usual time", tr_w, w25)]:
         h.append(f'<div class="tr"><p class="l">{label}</p>{_trend(vals, b, cur, KPI.TEAM_PCT_MIN)}</div>')
     h.append('</div></div>')
@@ -989,7 +1013,7 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
         h.append('<div class="pframe"><div class="top"><span class="h1">People &middot; tickets</span><span class="muted">only managers can see this section</span></div>')
         h.append('<p class="sec">Naveen works outside Jira and is not shown here.</p>')
         # stayed fixed squares
-        h.append(f'<div class="pcard"><div class="top"><span class="h2">Stayed fixed</span><span class="muted">{esc(month.strftime("%B"))} &middot; one square = one ticket</span></div>'
+        h.append(f'<div class="pcard"><div class="top"><span class="h2">Stayed fixed</span><span class="muted">{esc(label)} &middot; one square = one ticket</span></div>'
                  '<p class="q">Did it stay fixed after we delivered? Counted 30 days after delivery.</p>'
                  f'<p class="lead">Together the team: <b>{st_m["held"]} of {st_m["n"]}</b> settled held'
                  + (f' ({st_m["pct"]}%)' if st_m["n"] >= KPI.TEAM_PCT_MIN else "") + (f'. {st_m["waiting"]} still with the client.' if st_m["waiting"] else ".") + '</p>')
@@ -1003,7 +1027,7 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
             right = (f'<div class="kc"><b>{sf["held"]}</b> of {sf["n"]} held<small>{sf["came_back"]} came back &middot; about {e:.0f} expected</small></div>'
                      if sf["n"] else '<div class="kc"><b class="dim">&mdash;</b></div>')
             h.append(f'<div class="crow"><div class="pwho">{pav({"idx": idx, "ini": ini})}<div><p class="pname">{esc(name)}</p>{chip(kind, label, HEALTH_PERSON_TIP)}</div></div>'
-                     + (_squares(sq, small) if sq else '<span class="nil">Nothing delivered this month</span>') + right + '</div>')
+                     + (_squares(sq, small) if sq else '<span class="nil">Nothing delivered in this period</span>') + right + '</div>')
         h.append('<div class="end"></div><div class="legend" style="flex-wrap:wrap"><span><span class="sw s-held"></span>held</span>'
                  '<span><span class="sw s-back"></span>came back within 30 days</span><span><span class="sw s-wait"></span>still with the client (not scored)</span></div>'
                  f'<p class="pnote">Labels from {KPI.PERSON_LABEL_MIN} settled tickets; compared with the team&#39;s 2025 results on the same ticket types.</p></div>')
@@ -1019,7 +1043,7 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
             right = (f'<div class="kc"><b>{ok}</b> of {len(g)} within usual<small>{len(g) - ok} took longer &middot; about {e:.0f} expected</small></div>'
                      if len(g) else '<div class="kc"><b class="dim">&mdash;</b></div>')
             h.append(f'<div class="crow"><div class="pwho">{pav({"idx": idx, "ini": ini})}<div><p class="pname">{esc(name)}</p>{chip(kind, label, HEALTH_PERSON_TIP)}</div></div>'
-                     + (_squares(sq, small) if sq else '<span class="nil">Nothing delivered this month</span>') + right + '</div>')
+                     + (_squares(sq, small) if sq else '<span class="nil">Nothing delivered in this period</span>') + right + '</div>')
         h.append('<div class="end"></div><div class="legend"><span><span class="sw s-in"></span>within usual</span><span><span class="sw s-slow"></span>took longer</span></div></div>')
         # on their plate (open tickets now, by side)
         mx = max([len(v) for v in mv["by_holder"].values()] + [6])
@@ -1036,7 +1060,7 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
                      f'<div class="kc"><b>{len(mine)}</b> open<small>{cnt.get("team", 0)} on our side</small></div><div></div></div>')
         h.append('<div class="end"></div></div>')
         # where their tickets waited
-        h.append(f'<div class="pcard"><div class="top"><span class="h2">Where their tickets waited</span><span class="muted">context, not scored &middot; {esc(month.strftime("%B"))}</span></div>')
+        h.append(f'<div class="pcard"><div class="top"><span class="h2">Where their tickets waited</span><span class="muted">context, not scored &middot; {esc(label)}</span></div>')
         for idx, (uid, name, ini) in enumerate(model["people"]):
             g = sm[sm["main_owner"] == uid]
             if len(g) < KPI.PERSON_BAR_MIN:
@@ -1049,7 +1073,7 @@ def render_health(model: dict, month: pd.Period, today: dt.date, admin: bool, pe
                      f'<div class="kc" style="font-size:12px">{right}</div><div></div></div>')
         h.append('<div class="end"></div></div></div>')
     h.append('</div>')
-    return "".join(h)
+    return "".join(h[:split]) + "</div>", '<div class="dm">' + "".join(h[split:])
 
 
 def health_tab() -> None:
@@ -1079,16 +1103,69 @@ def health_tab() -> None:
             st.caption("Most likely the Jira account in the Streamlit secrets cannot see the team's MYDSUP tickets. "
                        "Sign in on Manage, open Jira sync and press Check connection: it shows which account is used and what it can see.")
         return
-    menu = _months_menu(today, model["base"].year)
-    default = 1 if len(menu) > 1 else 0          # last full month
-    month = st.selectbox("Month", menu, index=default, format_func=lambda m: _month_label(m, today), key="h_month",
-                         help="Calendar months, no rolling windows. Whose move and nudges are always live.")
+    menu = period_menu(today)
+    c1, c2 = st.columns([1.2, 2])
+    label = c1.selectbox("Period", [m for m, _ in menu], index=1, key="h_period")
+    months = dict(menu)[label]
+    sel_team = c2.multiselect("Team", TEAMS, placeholder="All teams", key="h_team")
+    linked = query("select user_id, full_name, jira_account_id from users where jira_account_id is not null")
+    linked["full_name"] = linked["full_name"].astype(str).str.strip()
+    if sel_team:
+        linked = linked[[TEAM_OF.get(n) in sel_team for n in linked["full_name"]]]
+    ids = {int(u) for u in linked["user_id"]} if sel_team else None
     people_on = str(secret("app", "ticket_people_view", "true")).lower() in ("true", "1", "yes")
-    label = f"synced {last.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}"
-    st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + HEALTH_CSS
-                + render_health(model, month, today, SEE_ALL, people_on, label), unsafe_allow_html=True)
-    with st.expander("How these are measured"):
-        st.markdown(HEALTH_HELP)
+    top, rest = render_health(model, label, months, today, SEE_ALL, people_on,
+                              f"synced {last.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}", ids)
+    st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + HEALTH_CSS + top, unsafe_allow_html=True)
+    flow_section(flow_model(last.isoformat()), label, months, dict(zip(linked["jira_account_id"], linked["full_name"])), bool(sel_team))
+    st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + HEALTH_CSS + rest, unsafe_allow_html=True)
+
+
+def _section(title: str, note: str = "") -> None:
+    st.markdown(CSS + f'<div class="dm"><div class="top" style="margin:28px 0 0"><span class="h2">{esc(title)}</span>'
+                f'<span class="muted">{esc(note)}</span></div></div>', unsafe_allow_html=True)
+
+
+def flow_section(fm: dict | None, label: str, months: list[pd.Period], accounts: dict[str, str], team_only: bool) -> None:
+    """Assigned and resolved: over time, per person, and who is busy because of many tickets or because they keep them."""
+    if fm is None:
+        st.info("Run supabase_ticket_people.sql and a Full re-sync to see assigned and resolved per person.")
+        return
+    pp = TF.per_person(fm, set(months), accounts)
+    if team_only:
+        pp = pp[pp["person"] != TF.OTHERS]
+    keep = set(accounts) if team_only else None
+    span = months if len(months) > 1 else list(pd.period_range(months[0] - 5, months[0], freq="M"))   # one month: show the 5 before too
+    pm = TF.per_month(fm, span, keep)
+    pm["label"] = [m.strftime("%b %y") for m in pm["month"]]
+    tot = pp[["assigned", "resolved", "open_now"]].sum()
+    _section("Assigned and resolved", f'{label} \u00b7 {int(tot["assigned"])} assigned \u00b7 {int(tot["resolved"])} resolved \u00b7 {int(tot["open_now"])} open now')
+    st.altair_chart(CH.flow(pm), width="stretch")
+    shown = pp[(pp["assigned"] > 0) | (pp["resolved"] > 0) | (pp["open_now"] > 0)]
+    if shown.empty:
+        st.caption("No tickets in this period.")
+        return
+    _section("Per person", "assigned and resolved in the period, open now")
+    st.altair_chart(CH.people(shown), width="stretch")
+    busy = CH.busy_why(shown)
+    if busy is not None:
+        _section("Busy because of many tickets, or because they keep them?", "dot size = open now \u00b7 dashed lines = the medians")
+        st.altair_chart(busy, width="stretch")
+    table = shown.assign(team=[TEAM_OF.get(p, "") for p in shown["person"]]).sort_values("assigned", ascending=False)
+    st.dataframe(
+        table[["person", "team", "assigned", "handed_on", "resolved", "resolved_pct", "open_now", "open_over_10bd", "oldest_open_bd", "median_bd"]],
+        hide_index=True, width="stretch",
+        column_config={
+            "person": st.column_config.TextColumn("Person"), "team": st.column_config.TextColumn("Team"),
+            "assigned": st.column_config.NumberColumn("Assigned", help="Tickets they received in the period"),
+            "handed_on": st.column_config.NumberColumn("Handed on", help="Of those, passed on to someone else"),
+            "resolved": st.column_config.NumberColumn("Resolved", help="Resolved in the period while assigned to them"),
+            "resolved_pct": st.column_config.NumberColumn("Resolved / assigned", format="%d%%"),
+            "open_now": st.column_config.NumberColumn("Open now"),
+            "open_over_10bd": st.column_config.NumberColumn("Open > 10 days", help="Open tickets they have held for more than 10 business days"),
+            "oldest_open_bd": st.column_config.NumberColumn("Oldest open (days)", format="%d"),
+            "median_bd": st.column_config.NumberColumn("Days to resolve", format="%.1f", help="Median business days from receiving to resolving"),
+        })
 
 
 # ----------------------------------------------------------------------------

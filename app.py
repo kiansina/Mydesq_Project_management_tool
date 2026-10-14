@@ -123,56 +123,59 @@ def last_sync_at() -> dt.datetime | None:
     return pd.to_datetime(v.iloc[0, 0], utc=True).to_pydatetime()
 
 
-def run_jira_sync(mode: str, log=None) -> dict | None:
-    """Pull changes from Jira into the database with the [jira] secrets. Read-only on Jira."""
-    from jira_client import Jira
-    from jira_sync import run_sync
-    cfg = st.secrets["jira"]
-    res = run_sync(conn().engine, Jira.from_mapping(cfg), mode, log=log or (lambda m: None))
-    st.cache_data.clear()
-    return res
-
-
 @st.cache_resource
-def _auto_sync_state() -> dict:
-    import threading
-    return {"lock": threading.Lock(), "last_try": None, "last_error": None}
+def _sync_state() -> dict:
+    """One sync at a time for the whole app. It runs in the background, so it goes on when the page is closed."""
+    return {"lock": threading.Lock(), "last_try": None, "running": None, "started": None, "progress": "", "outcome": None}
+
+
+def start_sync(mode: str) -> bool:
+    """Start an incremental or full sync in the background; False when one is already running."""
+    state = _sync_state()
+    if not state["lock"].acquire(blocking=False):
+        return False
+    now = dt.datetime.now(dt.timezone.utc)
+    cfg, engine = dict(st.secrets["jira"]), conn().engine
+    state.update(running=mode, started=now, last_try=now, progress="starting")
+
+    def log(m: str) -> None:
+        state["progress"] = m.strip()
+
+    def work():
+        from jira_client import Jira
+        from jira_sync import run_sync
+        try:
+            res = run_sync(engine, Jira.from_mapping(cfg), mode, log=log)
+            p = res.get("partial")
+            state["outcome"] = (("warning", f"Jira returned only {p['returned']} tickets against {p['stored']} stored, so the others "
+                                            "were left as they are. Press Check connection.") if p else
+                                ("success", f"{mode.capitalize()} sync finished: {res['tickets']} tickets refreshed in {res['seconds']:.0f} s."))
+            st.cache_data.clear()
+        except BaseException as e:  # noqa: BLE001 - background: record and move on
+            state["outcome"] = ("error", f"{mode.capitalize()} sync failed: " + (str(e).splitlines()[0][:200] if str(e) else type(e).__name__))
+        finally:
+            state["outcome"] = (*state["outcome"][:2], dt.datetime.now(dt.timezone.utc)) if state["outcome"] else None
+            state["running"] = None
+            state["lock"].release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
 
 
 def maybe_auto_sync() -> None:
-    """If the data is more than an hour old, fetch the latest Jira changes in the background.
-
-    Never blocks the page: one sync at a time for the whole app, and no new attempt within
-    15 minutes of the previous one (so a Jira outage cannot slow every visit down)."""
+    """When the data is over AUTO_SYNC_AFTER_MIN minutes old, catch up from Jira in the background
+    (at most one try every 15 minutes, never while another sync runs)."""
     if not secret("jira", "api_token", ""):
         return
     last = last_sync_at()
     now = dt.datetime.now(dt.timezone.utc)
     if last is None or now - last < dt.timedelta(minutes=AUTO_SYNC_AFTER_MIN):
         return
-    state = _auto_sync_state()
+    state = _sync_state()
     if state["last_try"] and now - state["last_try"] < dt.timedelta(minutes=15):
         return
-    if not state["lock"].acquire(blocking=False):
-        return
-    state["last_try"] = now
-    cfg, engine = dict(st.secrets["jira"]), conn().engine
-
-    def work():
-        from jira_client import Jira
-        from jira_sync import run_sync
-        try:
-            run_sync(engine, Jira.from_mapping(cfg), "incremental", log=lambda m: None)
-            state["last_error"] = None
-            st.cache_data.clear()
-        except BaseException as e:  # noqa: BLE001 - background: record and move on
-            state["last_error"] = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
-        finally:
-            state["lock"].release()
-
-    import threading
-    threading.Thread(target=work, daemon=True).start()
-    st.toast("Fetching the latest Jira changes in the background. Refresh in a minute to see them.")  # noqa: E501
+    if start_sync("incremental"):
+        st.toast("Fetching the latest Jira changes in the background.")
 
 
 def jira_diag() -> dict:
@@ -1389,7 +1392,8 @@ if tab_admin is None:                                 # Manage is for the admin 
 with tab_admin:
     st.caption("Changes go straight to Supabase and appear on the other tabs after Save.")
 
-    with st.expander("Jira sync", expanded=False):
+    _state = _sync_state()
+    with st.expander("Jira sync", expanded=bool(_state["running"])):
         _ls = last_sync_at()
         st.caption((f"Last sync {_ls.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}. " if _ls else "Not synced yet. ")
                    + f"The app fetches the latest Jira changes whenever someone opens it and the data is over {AUTO_SYNC_AFTER_MIN} minutes old.")
@@ -1397,9 +1401,18 @@ with tab_admin:
             st.info("To sync from here, add a [jira] section to the app secrets: base_url, email, api_token, project.")
         else:
             j1, j2, j3 = st.columns(3)
-            mode = "incremental" if j1.button("Sync changes now", key="jira_inc", width="stretch") else (
-                "full" if j2.button("Full re-sync (10-15 minutes)", key="jira_full", width="stretch",
-                                    help="Every MYDSUP ticket. Keep this tab open until it finishes.") else None)
+            if _state["running"]:
+                st.info(f"{_state['running'].capitalize()} sync running since "
+                        f"{_state['started'].astimezone(KPI.WORK_TZ):%H:%M}: {_state['progress']}. It goes on if you close this page.")
+                j1.button("Refresh", key="jira_refresh", width="stretch")
+            else:
+                mode = "incremental" if j1.button("Sync changes now", key="jira_inc", width="stretch") else (
+                    "full" if j2.button("Full re-sync (about 15 minutes)", key="jira_full", width="stretch",
+                                        help="Every MYDSUP ticket. Runs in the background.") else None)
+                if mode:
+                    if not start_sync(mode):
+                        st.warning("A sync is already running.")
+                    st.rerun()
             if j3.button("Check connection", key="jira_check", width="stretch",
                          help="Read-only: shows which Jira account the secrets use and how many team tickets it can see"):
                 try:
@@ -1421,28 +1434,9 @@ with tab_admin:
                            f" &middot; {_d.get('synced_tickets')} tickets with Jira data in the database"
                            + (f" &middot; only {_sm['partial'].get('returned')} of {_sm['partial'].get('stored')} stored tickets came back"
                               if isinstance(_sm.get("partial"), dict) else ""), unsafe_allow_html=True)
-            if mode:
-                with st.status(f"{mode.capitalize()} sync from Jira...", expanded=True) as box:
-                    try:
-                        res = run_jira_sync(mode, log=box.write)
-                        _auto_sync_state()["last_error"] = None
-                        _p = res.get("partial")
-                        st.session_state["_sync_msg"] = (
-                            ("warning", f"Jira returned only {_p['returned']} tickets against {_p['stored']} stored, so the others "
-                                        "were left as they are. The Jira account in the secrets may have lost access to part of "
-                                        "MYDSUP: press Check connection.") if _p else
-                            ("success", f"Refreshed {res['tickets']} tickets in {res['seconds']} s."))
-                        st.rerun()
-                    except (Exception, SystemExit) as e:  # noqa: BLE001
-                        box.update(label="Sync failed", state="error")
-                        st.error(str(e).splitlines()[0])
-            if st.session_state.get("_sync_msg"):
-                _m = st.session_state.pop("_sync_msg")
-                _kind, _text = _m if isinstance(_m, tuple) else ("success", _m)
-                (st.warning if _kind == "warning" else st.success)(_text)
-        _err = _auto_sync_state().get("last_error")
-        if _err:
-            st.caption(f"Last automatic catch-up failed: {_err}")
+            if _state["outcome"] and not _state["running"]:
+                _lvl, _txt, _at = _state["outcome"]
+                {"error": st.error, "warning": st.warning}.get(_lvl, st.success)(f"{_txt} ({_at.astimezone(KPI.WORK_TZ):%d %b %H:%M})")
 
     users_all = query("select user_id, full_name, initials, active from users order by user_id")
     users_all["active"] = users_all["active"].astype(bool)

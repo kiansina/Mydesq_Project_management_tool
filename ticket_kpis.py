@@ -397,7 +397,7 @@ def nudges(tk: dict[int, Ticket], now: dt.datetime) -> pd.DataFrame:
     """KPI 7: open tickets that went quiet. Client comments never reset the clock."""
     rows = []
     for t in tk.values():
-        if not t.open:
+        if not t.resolution_open:                # open as Jira counts it: no resolution yet
             continue
         side = t.side_now
         if side == "team":
@@ -431,8 +431,8 @@ def nudges(tk: dict[int, Ticket], now: dt.datetime) -> pd.DataFrame:
 
 
 def whose_move(tk: dict[int, Ticket], now: dt.datetime) -> dict:
-    """KPI 6: open = current status not delivered; grouped by side; plus the context lines."""
-    open_t = [t for t in tk.values() if t.open]
+    """KPI 6: open as Jira counts it (no resolution yet), grouped by side; plus the context lines."""
+    open_t = [t for t in tk.values() if t.resolution_open]
     counts = {}
     for t in open_t:
         counts[t.side_now] = counts.get(t.side_now, 0) + 1
@@ -441,9 +441,52 @@ def whose_move(tk: dict[int, Ticket], now: dt.datetime) -> dict:
     tri = [t for t in open_t if t.side_now == "triage"]
     cf = [t for t in tk.values() if t.status == "Client Feedback"]
     cf_old = sum(1 for t in cf if now - t.status_since > dt.timedelta(days=30))
-    hygiene = sum(1 for t in open_t if not t.resolution_open)
+    hygiene = sum(1 for t in tk.values() if t.open and not t.resolution_open)   # back in work, resolution never cleared
     return {"total": len(open_t), "counts": counts, "ours_over10": sum(1 for d in old_ours if d > 10),
             "ours_oldest_bd": max(old_ours) if old_ours else None, "triage": len(tri),
             "triage_oldest_h": max((bh(t.status_since, now) for t in tri), default=None),
             "cf": len(cf), "cf_30": cf_old, "hygiene": hygiene,
             "by_holder": {h: [t for t in open_t if t.holder_now == h] for h in {t.holder_now for t in open_t if isinstance(t.holder_now, int)}}}
+
+
+def work_hours(tickets: pd.DataFrame, events: pd.DataFrame, side_map: dict[str, str], now: dt.datetime) -> dict[int, dict[str, float]]:
+    """Business hours each person held a ticket while it was on our side (a 'team' status), by Jira account.
+
+    The same replay as build(), for every staff member and not only the people in the app.
+    tickets: ticket_id, created_at, jira_status, assignee_account. events: status and assignee changes with
+    from_account / to_account. Tickets without history (before the previous year) are left out."""
+    def acc(v):
+        return v if isinstance(v, str) and v else None
+
+    ev = events.copy()
+    ev["at"] = [_utc(x) for x in ev["at"]]
+    ev = ev.sort_values(["ticket_id", "at", "history_id", "item_no"])
+    by: dict[int, list] = {}
+    for r in ev.itertuples(index=False):
+        by.setdefault(int(r.ticket_id), []).append(r)
+    out: dict[int, dict[str, float]] = {}
+    for t in tickets.itertuples(index=False):
+        tid, created, rows = int(t.ticket_id), _utc(t.created_at), by.get(int(t.ticket_id))
+        if created is None or not rows:
+            continue
+        st_rows = [r for r in rows if r.field == "status"]
+        as_rows = [r for r in rows if r.field == "assignee"]
+        cur_s = (st_rows[0].from_value if st_rows else t.jira_status) or "Open"
+        cur_h = acc(as_rows[0].from_account) if as_rows else acc(t.assignee_account)
+        changes = sorted([(r.at, 0, acc(r.to_account)) for r in as_rows] + [(r.at, 1, r.to_value) for r in st_rows],
+                         key=lambda x: (x[0], x[1]))
+        hours: dict[str, float] = {}
+        cur_t = created
+        for at, kind, val in changes + [(now, 2, None)]:
+            at = max(at, created) if at is not None else cur_t
+            if at > cur_t:
+                if cur_h and side_map.get(cur_s) == "team":
+                    hours[cur_h] = hours.get(cur_h, 0.0) + bh(cur_t, at)
+                cur_t = at
+            if kind == 0:
+                cur_h = val
+            elif kind == 1:
+                cur_s = val
+        if hours:
+            out[tid] = hours
+    return out

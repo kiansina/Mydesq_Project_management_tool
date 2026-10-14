@@ -12,7 +12,8 @@ The Streamlit app calls run_sync(engine, jira) directly with its own secrets.
 
 What is stored: ticket fields (summary, type, priority, status, resolution, dates, assignee, organization),
 status/assignee/resolution/priority changes, comment metadata (who, when, public or internal - no text),
-and the Jira Service Management SLA cycles. Customers are stored only as the word "customer", never by name or id.
+and the Jira Service Management SLA cycles. Staff are stored by account and name (jira_people), to show who took,
+worked on and closed each ticket. Customers are stored only as the word "customer", never by name or id.
 """
 from __future__ import annotations
 
@@ -72,6 +73,18 @@ class People:
 
     def __init__(self, team: dict[str, int], names: dict[int, str]):
         self.team, self.names = team, names
+        self.staff_names: dict[str, str] = {}      # staff account -> display name, written to jira_people
+
+    def staff(self, account: dict | None) -> str | None:
+        """Account id of a staff member, never of a client; remembers the name."""
+        if not account or account.get("accountType") != "atlassian":
+            return None
+        self.staff_names[account["accountId"]] = account.get("displayName") or account["accountId"]
+        return account["accountId"]
+
+    def take_names(self) -> dict[str, str]:
+        out, self.staff_names = self.staff_names, {}
+        return out
 
     def who(self, account: dict | None) -> tuple[int | None, str]:
         if not account:
@@ -94,6 +107,11 @@ class Store:
         except sa.exc.InvalidRequestError as e:
             raise SystemExit(f"Database is missing Jira tables ({e}). Run supabase_jira_sync.sql first.") from e
         self.t = {n: self.md.tables[n] for n in names}
+        try:
+            self.md.reflect(engine, only=["jira_people"])
+            self.t["jira_people"] = self.md.tables["jira_people"]
+        except sa.exc.InvalidRequestError:
+            pass                                    # before supabase_ticket_people.sql: names are not kept
         missing = {"jira_key", "jira_status", "resolved_at", "assignee_name"} - set(self.t["tickets"].c.keys())
         if missing:
             raise SystemExit(f"tickets table lacks {sorted(missing)}. Run supabase_jira_sync.sql first.")
@@ -151,10 +169,41 @@ class Store:
                     if name == "jira_events" and rows:
                         c.execute(sa.delete(t).where(t.c.history_id.in_(sorted({r["history_id"] for r in rows}))))
                     if rows:
-                        c.execute(sa.insert(t), rows)
+                        keep = set(t.c.keys())              # columns added later are skipped until the SQL has run
+                        c.execute(sa.insert(t), [{k: v for k, v in r.items() if k in keep} for r in rows])
+
+    def save_people(self, names: dict[str, str]):
+        t = self.t.get("jira_people")
+        if t is None or not names:
+            return
+        insert = self.insert()
+        with self.engine.begin() as c:
+            for acc, name in names.items():
+                ins = insert(t).values(account_id=acc, display_name=name)
+                c.execute(ins.on_conflict_do_update(index_elements=["account_id"], set_={"display_name": ins.excluded.display_name}))
 
 
 # ----------------------------------------------------------------------------- transform
+def _lifecycle(f: dict, histories: list[dict], people: People) -> dict:
+    """Who took the ticket first, who set its resolution (closed it) and who was the assignee at that moment."""
+    hs = sorted(histories, key=lambda h: (ts(h.get("created")) or dt.datetime.min.replace(tzinfo=UTC), int(h["id"])))
+    moves = [(ts(h.get("created")), it.get("from"), it.get("to")) for h in hs for it in h.get("items", [])
+             if it.get("field") == "assignee"]
+    now_acc = people.staff(f.get("assignee"))
+    held = ([moves[0][1]] + [m[2] for m in moves]) if moves else [now_acc]
+    out = {"taken_by_account": next((a for a in held if a), None),
+           "closed_by_account": None, "closed_by_type": None, "closed_assignee_account": None}
+    closing = [h for h in hs if any(it.get("field") == "resolution" and it.get("toString") for it in h.get("items", []))]
+    if f.get("resolution") is None or not closing:
+        return out
+    h = closing[-1]                                  # the last time a resolution was set
+    at, acc = ts(h.get("created")), people.staff(h.get("author"))
+    before = [m for m in moves if m[0] is not None and at is not None and m[0] <= at]
+    out.update(closed_by_account=acc, closed_by_type="staff" if acc else people.who(h.get("author"))[1],
+               closed_assignee_account=before[-1][2] if before else (moves[0][1] if moves else now_acc))
+    return out
+
+
 def build_bundle(issue: dict, histories: list[dict], comments: list[dict], people: People) -> dict:
     f = issue["fields"]
     tid = int(issue["key"].split("-")[1])
@@ -177,10 +226,14 @@ def build_bundle(issue: dict, histories: list[dict], comments: list[dict], peopl
         "created_at": created, "updated_at": ts(f.get("updated")), "resolved_at": resolved,
         "reporter_type": people.who(f.get("reporter"))[1] if f.get("reporter") else None,   # the type only, never who
         "synced_at": dt.datetime.now(UTC),
+        "assignee_account": people.staff(assignee),
     }
+    if "changelog" in issue:                         # history read: who took it and who closed it (2025 onwards)
+        ticket.update(_lifecycle(f, histories, people))
     events = []
     for h in histories:
         a_uid_h, a_type = people.who(h.get("author"))
+        a_acc = people.staff(h.get("author"))
         at = ts(h.get("created"))
         for n, it in enumerate(h.get("items", [])):
             field = it.get("field")
@@ -188,8 +241,12 @@ def build_bundle(issue: dict, histories: list[dict], comments: list[dict], peopl
                 continue
             ev = {"ticket_id": tid, "history_id": int(h["id"]), "item_no": n, "at": at, "author_user_id": a_uid_h,
                   "author_type": a_type, "field": field, "from_value": it.get("fromString"), "to_value": it.get("toString"),
-                  "from_user_id": None, "to_user_id": None}
+                  "from_user_id": None, "to_user_id": None, "author_account": a_acc, "from_account": None, "to_account": None}
             if field == "assignee":
+                ev.update(from_account=it.get("from"), to_account=it.get("to"))
+                for k, n_ in (("from", "fromString"), ("to", "toString")):
+                    if it.get(k):
+                        people.staff_names.setdefault(it[k], it.get(n_) or it[k])
                 fu, tu = people.team.get(it.get("from")), people.team.get(it.get("to"))
                 ev.update(from_user_id=fu, to_user_id=tu,
                           from_value=people.names.get(fu) if fu else ("other" if it.get("from") else None),
@@ -212,7 +269,8 @@ def build_bundle(issue: dict, histories: list[dict], comments: list[dict], peopl
     for cm in comments:
         uid, kind = people.who(cm.get("author"))
         coms.append({"comment_id": int(cm["id"]), "ticket_id": tid, "author_user_id": uid, "author_type": kind,
-                     "created_at": ts(cm.get("created")), "is_public": cm.get("public", True)})
+                     "created_at": ts(cm.get("created")), "is_public": cm.get("public", True),
+                     "author_account": people.staff(cm.get("author"))})
     return {"ticket": ticket, "events": events, "comments": coms, "sla": sla}
 
 
@@ -255,6 +313,32 @@ def _chunks(items, n: int):
         yield buf
 
 
+def _drop_vanished(engine: sa.Engine, store: "Store", jira: Jira, returned: set[int], log) -> None:
+    """Open tickets the catch-up did not get back were deleted or moved out of the project: close them, as a full sync would.
+
+    The catch-up asks for every unresolved ticket, so an open ticket missing from the answer is checked one by one."""
+    tk = store.t["tickets"]
+    with engine.connect() as c:
+        rows = c.execute(sa.select(tk.c.ticket_id, tk.c.jira_key).where(tk.c.jira_key.is_not(None), tk.c.state == "Open")).all()
+    missing = [r for r in rows if r.ticket_id not in returned]
+    if len(missing) > 50:                          # far too many to be deletions: leave them for the next full sync
+        log(f"{len(missing)} open tickets were not returned; the next full re-sync will settle them")
+        return
+    gone = []
+    for r in missing:
+        p = jira.probe(f"/rest/api/3/issue/{r.jira_key}?fields=project")
+        moved = p["status"] == 200 and (p["body"].get("fields") or {}).get("project", {}).get("key") != jira.project
+        if p["status"] == 404 or moved:
+            gone.append(r.ticket_id)
+    if not gone:
+        return
+    with engine.begin() as c:
+        for name in ("jira_events", "jira_comments", "jira_sla"):
+            c.execute(sa.delete(store.t[name]).where(store.t[name].c.ticket_id.in_(gone)))
+        c.execute(sa.update(tk).where(tk.c.ticket_id.in_(gone)).values(state="Closed", jira_status="Not in Jira scope"))
+    log(f"{len(gone)} tickets deleted or moved in Jira were marked closed")
+
+
 def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print, workers: int = 6) -> dict:
     store = Store(engine)
     people = store.people()
@@ -275,15 +359,16 @@ def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print
     last = store.get_state("last_sync_at")
     if mode != "full" and last:
         minutes = int((started - dt.datetime.fromisoformat(last)).total_seconds() // 60) + 20
-        # changed tickets, plus every open one so its live SLA flags stay fresh
-        passes = [(f"{project} AND (updated >= -{minutes}m OR status in ({OPEN_STATUSES_JQL}))", "changelog")]
+        # changed tickets, plus every open one so its live SLA flags stay fresh and deletions are noticed below
+        passes = [(f"{project} AND (updated >= -{minutes}m OR resolution = Unresolved OR status in ({OPEN_STATUSES_JQL}))",
+                   "changelog")]
     else:
         mode = "full"
         since = cutoff.strftime("%Y-%m-%d")
         # recent tickets with their history; older ones as rows only (their history is not kept)
         passes = [(f'{project} AND updated >= "{since}"', "changelog"), (f'{project} AND updated < "{since}"', None)]
     log(f"{mode} sync: {'changed and open tickets' if mode != 'full' else f'every {jira.project} ticket, about {seen}'}")
-    done = 0
+    done, returned = 0, set()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for jql, expand in passes:
             pages = jira.search(jql + " ORDER BY key ASC", FIELDS, expand=expand, page=50 if expand else 100)
@@ -291,12 +376,16 @@ def run_sync(engine: sa.Engine, jira: Jira, mode: str = "incremental", log=print
                 batch = [build_bundle(*got, people) for got in pool.map(lambda i: _details(jira, i, cutoff), chunk)
                          if got is not None]
                 store.save(batch)
+                store.save_people(people.take_names())
+                returned.update(b["ticket"]["ticket_id"] for b in batch)
                 if (done + len(batch)) // 1000 > done // 1000 or mode != "full":
                     log(f"  saved {done + len(batch)} tickets")
                 done += len(batch)
     if mode == "full" and not done:
         raise RuntimeError(f"Jira returned no {jira.project} tickets, so nothing was changed. "
                            "Check that the Jira account in the secrets can open the project.")
+    if mode != "full":
+        _drop_vanished(engine, store, jira, returned, log)
     summary = {"mode": mode, "tickets": done, "started": started.isoformat(),
                "seconds": round((dt.datetime.now(UTC) - started).total_seconds(), 1)}
     # far fewer tickets than stored: more likely lost permissions than half the tickets gone

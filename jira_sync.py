@@ -147,40 +147,48 @@ class Store:
                                                                            "updated_at": ins.excluded.updated_at}))
 
     def save(self, bundles: list[dict]):
-        """Upsert tickets and replace their history rows, in one transaction."""
+        """Upsert a batch of tickets and replace their history rows, in one transaction.
+
+        A handful of statements per batch, not several per ticket: over the network to Supabase, round trips
+        are what a sync waits for."""
         if not bundles:
             return
         tk = self.t["tickets"]
         cols = set(tk.c.keys())
         insert = self.insert()
+        latest = {b["ticket"]["ticket_id"]: b for b in bundles}   # one per ticket: a duplicate would break the multi-row upsert
+        bundles = list(latest.values())
+        rows = {tid: {k: v for k, v in b["ticket"].items() if k in cols} for tid, b in latest.items()}
+        ids = list(rows)
+        groups = {}                                 # rows with the same columns go in one statement
+        for r in rows.values():
+            groups.setdefault(tuple(sorted(r)), []).append(r)
         with self.engine.begin() as c:
-            for b in bundles:
-                row = {k: v for k, v in b["ticket"].items() if k in cols}
-                ins = insert(tk).values(**row)
+            for keys, group in groups.items():
+                ins = insert(tk)
                 c.execute(ins.on_conflict_do_update(index_elements=["ticket_id"],
-                                                    set_={k: ins.excluded[k] for k in row if k != "ticket_id"}))
-                tid = row["ticket_id"]
-                for name, rows in (("jira_events", b["events"]), ("jira_comments", b["comments"]), ("jira_sla", b["sla"])):
-                    t = self.t[name]
-                    c.execute(sa.delete(t).where(t.c.ticket_id == tid))
-                    # a ticket that moved to a new key keeps its comment and history ids: clear those too
-                    if name == "jira_comments" and rows:
-                        c.execute(sa.delete(t).where(t.c.comment_id.in_([r["comment_id"] for r in rows])))
-                    if name == "jira_events" and rows:
-                        c.execute(sa.delete(t).where(t.c.history_id.in_(sorted({r["history_id"] for r in rows}))))
-                    if rows:
-                        keep = set(t.c.keys())              # columns added later are skipped until the SQL has run
-                        c.execute(sa.insert(t), [{k: v for k, v in r.items() if k in keep} for r in rows])
+                                                    set_={k: ins.excluded[k] for k in keys if k != "ticket_id"}), group)
+            for name, part in (("jira_events", "events"), ("jira_comments", "comments"), ("jira_sla", "sla")):
+                t = self.t[name]
+                child = [r for b in bundles for r in b[part]]
+                c.execute(sa.delete(t).where(t.c.ticket_id.in_(ids)))
+                # a ticket that moved to a new key keeps its comment and history ids: clear those too
+                if name == "jira_comments" and child:
+                    c.execute(sa.delete(t).where(t.c.comment_id.in_(sorted({r["comment_id"] for r in child}))))
+                if name == "jira_events" and child:
+                    c.execute(sa.delete(t).where(t.c.history_id.in_(sorted({r["history_id"] for r in child}))))
+                if child:
+                    keep = set(t.c.keys())              # columns added later are skipped until the SQL has run
+                    c.execute(sa.insert(t), [{k: v for k, v in r.items() if k in keep} for r in child])
 
     def save_people(self, names: dict[str, str]):
         t = self.t.get("jira_people")
         if t is None or not names:
             return
-        insert = self.insert()
+        ins = self.insert()(t)
         with self.engine.begin() as c:
-            for acc, name in names.items():
-                ins = insert(t).values(account_id=acc, display_name=name)
-                c.execute(ins.on_conflict_do_update(index_elements=["account_id"], set_={"display_name": ins.excluded.display_name}))
+            c.execute(ins.on_conflict_do_update(index_elements=["account_id"], set_={"display_name": ins.excluded.display_name}),
+                      [{"account_id": a, "display_name": n} for a, n in names.items()])
 
 
 # ----------------------------------------------------------------------------- transform

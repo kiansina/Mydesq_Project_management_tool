@@ -82,6 +82,27 @@ def month_of(d: dt.datetime) -> pd.Period:
     return pd.Timestamp(d.astimezone(WORK_TZ).replace(tzinfo=None)).to_period("M")
 
 
+BULK_MIN = 200          # one account changing the status of this many tickets in a day is a bulk edit, not work
+
+
+def drop_bulk(events: pd.DataFrame) -> pd.DataFrame:
+    """Status changes made in bulk (e.g. 9 and 12 Jan 2026: 5,000 closed tickets reopened and closed again) are not work:
+    drop them before any replay, or every one of those tickets looks held on our side for days."""
+    if events.empty or "author_account" not in events.columns:
+        return events
+    st_ = events[(events["field"] == "status") & events["author_account"].notna()]
+    if st_.empty:
+        return events
+    day = pd.to_datetime(st_["at"], utc=True).dt.tz_convert(WORK_TZ).dt.date
+    size = st_.assign(_day=day).groupby(["author_account", "_day"])["ticket_id"].nunique()
+    bulk = {k for k, n in size.items() if n >= BULK_MIN}
+    if not bulk:
+        return events
+    keys = list(zip(st_["author_account"], day))
+    drop = st_.index[[k in bulk for k in keys]]
+    return events.drop(index=drop)
+
+
 # ----------------------------------------------------------------------------- per-ticket replay
 @dataclass
 class Segment:

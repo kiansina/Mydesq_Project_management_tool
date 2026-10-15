@@ -1353,7 +1353,8 @@ MODULE_TEAM = where(team, [n in _in_module for n in team["name"]]) if SEE_ALL el
 MODULE_NAMES = [str(n).strip() for n in MODULE_TEAM["name"]]
 
 # Only the chosen section runs, so a click in one section never rebuilds the others.
-_SECTIONS = (["Tickets", "Ticket health", "Deliverables"] + (["Manage"] if IS_ADMIN else [])) if SEE_ALL else ["My tickets", "Deliverables"]
+_SECTIONS = ((["Dashboard", "Tickets", "Ticket health", "Deliverables"] + (["Manage"] if IS_ADMIN else [])) if SEE_ALL
+             else ["Dashboard", "My tickets", "Deliverables"])
 SECTION = (st.segmented_control("Section", _SECTIONS, default=_SECTIONS[0], key="section", label_visibility="collapsed")
            or st.session_state.get("_section_last", _SECTIONS[0]))      # clicking the open section again keeps it open
 st.session_state["_section_last"] = SECTION
@@ -1614,7 +1615,83 @@ def manage_tables() -> None:
         editor(spec, df, lookups, f"ed_projects_{tag}")
 
 
-if SECTION in ("Tickets", "My tickets"):
+def dashboard_section() -> None:
+    """One person's page: their tickets for a period, their projects, their open tickets.
+    A user sees their own; managers and the admin choose anyone (view only)."""
+    me = (ACCOUNT["name"] or "").strip().lower()
+    if SEE_ALL:
+        options = list(names)
+        default = next((i for i, n in enumerate(options) if n.lower() == me), 0)
+        person = st.selectbox("Person", options, index=default, key="db_person")
+    else:
+        person = ME
+    menu = period_menu(today)
+    c1, c2 = st.columns([1.3, 1])
+    with c1:
+        kind = st.segmented_control("Period", list(menu), default="Year", key="db_kind") or "Year"
+    choices = menu[kind]
+    if len(choices) == 1:
+        label, months = choices[0]
+    else:
+        label = c2.selectbox(kind, [c for c, _ in choices], key=f"db_{kind.lower()}")
+        months = dict(choices)[label]
+
+    linked = query("select full_name, jira_account_id from users where jira_account_id is not null")
+    acc = {str(n).strip(): a for n, a in zip(linked["full_name"], linked["jira_account_id"])}.get(person)
+    tables = flow_tables(SYNC_KEY, tuple(str(m) for m in months), ((acc, person),), True) if acc and SYNC_KEY else None
+    row = tables[0].iloc[0] if tables is not None and len(tables[0]) else None
+    mine = projects[projects["owner"] == person] if projects is not None else None
+    ps = DL.stats(mine[mine["outcome"] != "cancelled"], today) if mine is not None else None
+
+    def tile(lbl, val, sub):
+        return f'<div class="kpi"><p class="l">{lbl}</p><p class="v">{val}</p><p class="d">{sub}</p></div>'
+
+    h = [f'<div class="dm"><div class="top"><span class="h1">{esc(person)} <span class="tm">{esc(TEAM_OF.get(person, ""))}</span></span><span class="muted">{esc(label)}</span></div><div class="kpis">']
+    if row is not None:
+        h.append(tile("Assigned", int(row["assigned"]), f'{int(row["handed_on"])} handed on'))
+        h.append(tile("Resolved", int(row["resolved"]), f'{int(row["resolved_pct"])}% of assigned' if pd.notna(row["resolved_pct"]) else "&nbsp;"))
+        h.append(tile("Open now", int(row["open_now"]), f'{int(row["open_over_10bd"])} for more than 10 days'))
+        h.append(tile("Days to resolve", f'{row["median_bd"]:.1f}' if pd.notna(row["median_bd"]) else "&mdash;", "median, business days"))
+    if ps is not None:
+        h.append(tile("Projects open", ps["open"], f'{ps["overdue"]} overdue' if ps["overdue"] else "none overdue"))
+        h.append(tile("Projects kept", f'{ps["kept_pct"]}%' if ps["kept_pct"] is not None else "&mdash;",
+                      f'{ps["kept"]} of {ps["settled"]} by the due date' if ps["settled"] else "nothing due yet"))
+    h.append('</div></div>')
+    st.markdown(CSS + h[0] + "".join(h[1:]), unsafe_allow_html=True)
+    if not acc:
+        st.caption("Not linked to a Jira account: no ticket numbers.")
+    elif tables is not None:
+        _section("Assigned and resolved", label)
+        st.altair_chart(CH.flow(tables[1]), width="stretch")
+
+    if mine is not None:
+        _section("Projects")
+        st.markdown(CSS + PEOPLE_CSS + DL.CSS + DL.my_view(mine, today, JIRA), unsafe_allow_html=True)
+
+    fm = flow_model(SYNC_KEY) if acc and SYNC_KEY else None
+    if fm is not None:
+        op = fm["open_now"][fm["open_now"]["account"] == acc]
+        _section("Open tickets", f"{len(op)} now")
+        if len(op):
+            tk_all = _tickets_for(SYNC_KEY)[0]
+            lines = ticket_lines(SYNC_KEY)
+            show = op.merge(tk_all[["number", "key", "summary", "jira_status"]], left_on="ticket_id", right_on="number", how="left")
+            show = show.sort_values("age_bd", ascending=False)
+            st.dataframe(
+                pd.DataFrame({"Ticket": [f"{JIRA}/browse/{k}" for k in show["key"]], "Summary": show["summary"],
+                              "Status": show["jira_status"], "With them since": [x.astimezone(KPI.WORK_TZ).date() for x in show["since"]],
+                              "Days held": show["age_bd"].round(0).astype(int),
+                              "History": [lines.get(int(t), "") for t in show["ticket_id"]]}),
+                hide_index=True, width="stretch",
+                column_config={"Ticket": st.column_config.LinkColumn("Ticket", display_text=r".*/browse/(.*)"),
+                               "Summary": st.column_config.TextColumn("Summary", width="large"),
+                               "With them since": st.column_config.DateColumn("With them since", format="DD/MM/YYYY"),
+                               "Days held": st.column_config.NumberColumn("Days held", help="Business days since they received it")})
+
+
+if SECTION == "Dashboard":
+    dashboard_section()
+elif SECTION in ("Tickets", "My tickets"):
     tickets_section()
 elif SECTION == "Ticket health":
     try:

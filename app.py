@@ -1416,16 +1416,23 @@ def deliverables_tab() -> None:
     if projects is None:
         st.warning("Run supabase_projects.sql in Supabase to start using projects.")
         return
-    view = "My projects"
+    view = "Person"
     if SEE_ALL:
-        view = st.segmented_control("View", ["My projects", "Team"], default="My projects", key="d_view",
-                                    label_visibility="collapsed") or "My projects"
-    if view == "My projects":
-        mine = projects[projects["user_id"] == USER_ID] if USER_ID is not None else projects.iloc[0:0]
-        if USER_ID is None:
-            st.info("Your sign-in is not linked to a person in the users table, so you have no projects.")
+        view = st.segmented_control("View", ["Person", "Team"], default="Person", key="d_view",
+                                    label_visibility="collapsed") or "Person"
+    if view == "Person":
+        me = (ACCOUNT["name"] or "").strip().lower()
+        if SEE_ALL:                               # managers and the admin can open anyone's projects
+            default = next((i for i, n in enumerate(names) if n.lower() == me), 0)
+            person = st.selectbox("Person", names, index=default, key="d_person")
         else:
-            project_actions(mine)
+            person = ME
+        own = person.lower() == me
+        mine = projects[projects["owner"] == person]
+        if own and USER_ID is not None:
+            project_actions(mine)                 # add, close and link only on your own projects
+        elif own:
+            st.info("Your sign-in is not linked to a person in the users table, so you have no projects.")
         st.markdown(CSS + PEOPLE_CSS + DL.CSS + DL.my_view(mine, today, JIRA), unsafe_allow_html=True)
         return
     teams_here = list(dict.fromkeys(TEAM_OF[n] for n in MODULE_NAMES if TEAM_OF.get(n)))

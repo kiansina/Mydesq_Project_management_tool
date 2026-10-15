@@ -515,8 +515,11 @@ def clean(value, kind: str):
     return str(value).strip()
 
 
+DELETE = "_delete"                          # the Delete tick box every Manage table gets
+
+
 def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict) -> tuple[int, str | None]:
-    """Run inserts, updates and deletes for one table. Returns (rows changed, error)."""
+    """Run inserts, updates and deletes for one table in one transaction. Returns (rows changed, error)."""
     table, pk = spec["table"], spec["pk"]
     kinds = spec["kinds"]
     to_db = spec.get("to_db", {})          # display column -> (db column, mapping dict name)
@@ -527,22 +530,26 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
             return db_col, (lookups[lookup].get(val) if val is not None else None)
         return col, val
 
-    ops = []
+    def key_of(idx):
+        return clean(original.iloc[int(idx)][pk], kinds.get(pk, "int"))
+
+    ops, gone = [], set(state["deleted_rows"])
     for idx, changes in state["edited_rows"].items():
-        row_pk = original.iloc[int(idx)][pk]
-        sets, params = [], {"pk": int(row_pk)}
+        if changes.get(DELETE):
+            gone.add(int(idx))
+            continue
+        sets, params = [], {"pk": key_of(idx)}
         for col, val in changes.items():
+            if col == DELETE or col not in kinds:
+                continue
             db_col, v = db_pair(col, clean(val, kinds[col]))
             sets.append(f"{db_col} = :{db_col}")
             params[db_col] = v
-        if table == "deliverables" and params.get("status") == "Done" and "completed_on" not in params:
-            # Done needs a completion date: default to today unless the row already has one.
-            if not is_date(original.iloc[int(idx)].get("completed_on")):
-                sets.append("completed_on = :completed_on")
-                params["completed_on"] = dt.date.today()
         if sets:
             ops.append((f"update {table} set {', '.join(sets)} where {pk} = :pk", params))
     for row in state["added_rows"]:
+        if row.get(DELETE):
+            continue
         cols, params = [], {}
         for col, val in row.items():
             if col not in kinds:
@@ -552,16 +559,12 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
                 continue
             cols.append(db_col)
             params[db_col] = v
-        if table == "deliverables" and params.get("status") == "Done" and params.get("completed_on") is None:
-            if "completed_on" not in cols:
-                cols.append("completed_on")
-            params["completed_on"] = dt.date.today()
         missing = [c for c in spec["required"] if c not in params or params[c] is None]
         if missing:
             return 0, f"New row is missing: {', '.join(missing)}"
         ops.append((f"insert into {table} ({', '.join(cols)}) values ({', '.join(':' + c for c in cols)})", params))
-    for idx in state["deleted_rows"]:
-        ops.append((f"delete from {table} where {pk} = :pk", {"pk": int(original.iloc[int(idx)][pk])}))
+    for idx in sorted(gone):
+        ops.append((f"delete from {table} where {pk} = :pk", {"pk": key_of(idx)}))
 
     if not ops:
         return 0, None
@@ -574,32 +577,40 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
             s.commit()
     except SQLAlchemyError as e:
         msg = str(getattr(e, "orig", e)).split("\n")[0]
-        if "deliverables_check" in msg:
-            msg = "A deliverable marked Done needs a Completed date."
-        elif "violates foreign key" in msg:
-            msg = "That row is still referenced by another table (for example a person who owns deliverables)."
+        if "violates foreign key" in msg or "FOREIGN KEY constraint" in msg:
+            msg = "That row is still used elsewhere (for example a person who owns projects or tickets). For a person, untick Active instead."
+        elif "duplicate key" in msg or "UNIQUE constraint" in msg:
+            msg = "That value already exists in another row."
         return 0, msg
     return len(ops), None
 
 
-def editor(spec: dict, df: pd.DataFrame, lookups: dict, key: str) -> None:
-    st.data_editor(
-        df, key=key, num_rows="dynamic", hide_index=True, width="stretch",
-        column_config=spec["config"], disabled=spec.get("disabled", []),
-    )
+def editor(spec: dict, df: pd.DataFrame, lookups: dict, key: str, after_save=None) -> None:
+    """The admin's grid: edit any cell, add rows at the bottom, tick Delete to remove a row, then Save."""
+    df = df.copy()
+    df.insert(0, DELETE, False)
+    config = {DELETE: st.column_config.CheckboxColumn("Delete", default=False, width="small",
+                                                      help="Tick, then Save, to remove the row for good"), **spec["config"]}
+    st.data_editor(df, key=key, num_rows="dynamic", hide_index=True, width="stretch",
+                   column_config=config, disabled=spec.get("disabled", []))
     state = st.session_state.get(key, {"edited_rows": {}, "added_rows": [], "deleted_rows": []})
+    n_del = len(state["deleted_rows"]) + sum(1 for c in state["edited_rows"].values() if c.get(DELETE))
     n = len(state["edited_rows"]) + len(state["added_rows"]) + len(state["deleted_rows"])
-    c1, c2 = st.columns([1, 4])
-    if c1.button(f"Save {n} change{'s' if n != 1 else ''}", disabled=n == 0, key=key + "_save", type="primary"):
+    label = f"Save {n} change{'s' if n != 1 else ''}" + (f" ({n_del} to delete)" if n_del else "")
+    if st.button(label, disabled=n == 0, key=key + "_save", type="primary"):
         done, err = apply_changes(spec, df, state, lookups)
         if err:
             st.error(f"Nothing saved. {err}")
         else:
             st.cache_data.clear()
+            if after_save:
+                after_save()
             del st.session_state[key]
-            st.success(f"Saved {plural(done, 'change')}.")
+            st.session_state["_manage_msg"] = f"Saved {plural(done, 'change')}."
             st.rerun()
-    c2.caption("Edit cells directly. Add a row at the bottom of the table, delete with the checkbox on the left, then Save.")
+    msg = st.session_state.pop("_manage_msg", None)
+    if msg:
+        st.success(msg)
 
 
 # ----------------------------------------------------------------------------
@@ -1522,13 +1533,13 @@ with tab_admin:
                 _lvl, _txt, _at = _state["outcome"]
                 {"error": st.error, "warning": st.warning}.get(_lvl, st.success)(f"{_txt} ({_at.astimezone(KPI.WORK_TZ):%d %b %H:%M})")
 
-    users_all = query("select user_id, full_name, initials, active from users order by user_id")
+    users_all = query("select user_id, full_name, initials, active, jira_account_id from users order by user_id")
     users_all["active"] = users_all["active"].astype(bool)
     name_to_id = {str(n): int(i) for i, n in zip(users_all["user_id"], users_all["full_name"])}
     ticket_ids = [int(x) for x in tickets["number"].tolist()]
     lookups = {"users": name_to_id, "assignee": {**name_to_id, "Unassigned": None}}
 
-    which = st.radio("Table", ["Projects", "Tickets", "Users", "Teams"], horizontal=True, key="admin_table")
+    which = st.radio("Table", ["Projects", "Tickets", "Users", "Teams", "Holidays", "Status map"], horizontal=True, key="admin_table")
 
     if which == "Projects":
         if projects is None:
@@ -1594,19 +1605,20 @@ with tab_admin:
         spec = {
             "table": "users", "pk": "user_id",
             "required": ["full_name", "initials"],
-            "kinds": {"user_id": "int", "full_name": "text", "initials": "text", "active": "bool"},
+            "kinds": {"user_id": "int", "full_name": "text", "initials": "text", "active": "bool", "jira_account_id": "text"},
             "disabled": ["user_id"],
             "config": {
                 "user_id": st.column_config.NumberColumn("ID", width="small"),
                 "full_name": st.column_config.TextColumn("Full name", required=True),
                 "initials": st.column_config.TextColumn("Initials", max_chars=4, required=True),
                 "active": st.column_config.CheckboxColumn("Active", default=True),
+                "jira_account_id": st.column_config.TextColumn("Jira account", help="Jira account id; empty = not linked to Jira"),
             },
         }
         users_ed = users_all
         try:
             teams_df = query("select team_id, name from teams order by coalesce(sort_order, 999), name")
-            users_ed = query("""select u.user_id, u.full_name, u.initials, t.name as team, u.active
+            users_ed = query("""select u.user_id, u.full_name, u.initials, t.name as team, u.active, u.jira_account_id
                                 from users u left join teams t on t.team_id = u.team_id order by u.user_id""")
             users_ed["active"] = users_ed["active"].astype(bool)
             lookups["teams"] = {str(n): int(i) for i, n in zip(teams_df["team_id"], teams_df["name"])}
@@ -1616,8 +1628,7 @@ with tab_admin:
         except Exception:  # noqa: BLE001 - before supabase_teams.sql: no Team column
             st.caption("Run supabase_teams.sql in Supabase to give everyone a team.")
         editor(spec, users_ed, lookups, "ed_users")
-        st.caption("Tip: untick Active instead of deleting a person who still has deliverables or tickets. "
-                   "A new person signs in after a [users.<username>] block with their full name is added to the app secrets.")
+        st.caption("A new person signs in once a [users.<username>] block with their full name is in the app secrets.")
 
     elif which == "Teams":
         try:
@@ -1638,4 +1649,27 @@ with tab_admin:
                 },
             }
             editor(spec, teams_df, lookups, "ed_teams")
-            st.caption("To move a person to another team, change Team on the Users table.")
+
+    elif which in ("Holidays", "Status map"):
+        def _rebuild():                       # business hours and sides feed the ticket numbers: work them out again
+            health_model.clear()
+            flow_model.clear()
+        if which == "Holidays":
+            df = query("select day, note from holidays order by day")
+            df["day"] = to_dates(df["day"])
+            spec = {"table": "holidays", "pk": "day", "required": ["day"], "kinds": {"day": "date", "note": "text"},
+                    "config": {"day": st.column_config.DateColumn("Day", format="DD/MM/YYYY", required=True),
+                               "note": st.column_config.TextColumn("Note", width="large")}}
+            editor(spec, df, lookups, "ed_holidays", after_save=_rebuild)
+        else:
+            df = query("select status, side, note, delivered from jira_status_map order by status")
+            df["delivered"] = [bool(x) for x in df["delivered"]]
+            spec = {"table": "jira_status_map", "pk": "status", "required": ["status", "side"],
+                    "kinds": {"status": "text", "side": "text", "note": "text", "delivered": "bool"},
+                    "config": {"status": st.column_config.TextColumn("Jira status", required=True),
+                               "side": st.column_config.SelectboxColumn("Whose move", required=True,
+                                                                        options=["triage", "team", "client", "external", "release", "done"]),
+                               "note": st.column_config.TextColumn("Note", width="large"),
+                               "delivered": st.column_config.CheckboxColumn("Delivered", default=False,
+                                                                            help="The ticket counts as delivered in this status")}}
+            editor(spec, df, lookups, "ed_status", after_save=_rebuild)

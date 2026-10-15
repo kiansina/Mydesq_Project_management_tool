@@ -343,34 +343,57 @@ def scored(fd: pd.DataFrame, base: Baseline) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------- KPIs
-def answered_in_time(tk: dict[int, Ticket], sla: pd.DataFrame, reporter: dict[int, str], team_ids: set[int],
-                     months: set[pd.Period]) -> dict:
-    """KPI 1: Jira first-response SLA, lowest cycle, tickets created in the months, first assignee on the team."""
+_AIT: dict = {}          # prepared first-response outcome per ticket, per (tickets, sla, reporter) objects
+
+
+def _ait_rows(tk: dict[int, Ticket], sla: pd.DataFrame, reporter: dict[int, str]) -> list[tuple]:
+    """One row per ticket raised by a customer: (month, first assignee, outcome, elapsed ms or None, key).
+    Worked out once per model (the model lives until the next sync) instead of on every call."""
+    key = (id(tk), id(sla), id(reporter), len(tk), len(sla))
+    if key in _AIT:
+        return _AIT[key]
     first = sla.sort_values(["ticket_id", "cycle"]).groupby("ticket_id").head(1).set_index("ticket_id")
-    on, late, waiting, no_sla, med = 0, 0, 0, 0, []
-    late_keys = []
+    rows = []
     for t in tk.values():
-        if month_of(t.created) not in months or t.first_assignee not in team_ids:
-            continue
         if reporter and reporter.get(t.ticket_id, "customer") != "customer":
             continue
         if t.ticket_id not in first.index:
-            no_sla += 1
+            rows.append((month_of(t.created), t.first_assignee, "no_sla", None, t.key))
             continue
         r = first.loc[t.ticket_id]
         ongoing, breached = bool(r["ongoing"]), bool(r["breached"]) if not pd.isna(r["breached"]) else False
         el, goal = r["elapsed_ms"], r["goal_ms"]
         if (not ongoing) and not breached:
-            on += 1
-            if not pd.isna(el):
-                med.append(float(el))
+            rows.append((month_of(t.created), t.first_assignee, "on", None if pd.isna(el) else float(el), t.key))
         elif breached or (ongoing and not pd.isna(el) and not pd.isna(goal) and el > goal):
+            rows.append((month_of(t.created), t.first_assignee, "late", None if ongoing or pd.isna(el) else float(el), t.key))
+        else:
+            rows.append((month_of(t.created), t.first_assignee, "waiting", None, t.key))
+    if len(_AIT) > 8:
+        _AIT.clear()
+    _AIT[key] = rows
+    return rows
+
+
+def answered_in_time(tk: dict[int, Ticket], sla: pd.DataFrame, reporter: dict[int, str], team_ids: set[int],
+                     months: set[pd.Period]) -> dict:
+    """KPI 1: Jira first-response SLA, lowest cycle, tickets created in the months, first assignee on the team."""
+    on, late, waiting, no_sla, med = 0, 0, 0, 0, []
+    late_keys = []
+    for month, first_assignee, outcome, el, key in _ait_rows(tk, sla, reporter):
+        if month not in months or first_assignee not in team_ids:
+            continue
+        if outcome == "no_sla":
+            no_sla += 1
+        elif outcome == "on":
+            on += 1
+        elif outcome == "late":
             late += 1
-            late_keys.append(t.key)
-            if not ongoing and not pd.isna(el):
-                med.append(float(el))
+            late_keys.append(key)
         else:
             waiting += 1
+        if el is not None:
+            med.append(el)
     n = on + late
     return {"on": on, "late": late, "n": n, "waiting": waiting, "no_sla": no_sla, "late_keys": late_keys,
             "pct": round(100 * on / n) if n else None,

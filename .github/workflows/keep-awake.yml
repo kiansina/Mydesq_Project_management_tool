@@ -1,0 +1,62 @@
+# Keeps the Streamlit Community Cloud app awake: every 4 hours a real browser opens it
+# (Streamlit puts apps to sleep after 12 hours without visitors) and, if it is asleep, presses
+# "Yes, get this app back up!". No secrets needed: safe in a public repository.
+#
+# Set APP_URL below to your app's address (the one you share in Teams).
+name: keep-app-awake
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"        # every 4 hours, at minute 17 (UTC)
+  workflow_dispatch:               # lets you run it by hand from the Actions tab
+
+env:
+  APP_URL: https://mydesq-project-management-tool.streamlit.app/
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install a headless browser
+        run: |
+          pip install playwright==1.47.0
+          python -m playwright install --with-deps chromium
+      - name: Open the app, wake it if it sleeps
+        run: |
+          python - <<'EOF'
+          import os, re, sys, time
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"].strip()
+          if "YOUR-APP" in url:
+              sys.exit("Set APP_URL in .github/workflows/keep-awake.yml to the app's address.")
+
+          def app_is_up(page):
+              # the app runs inside a frame; its sign-in page shows "Daily module"
+              for f in page.frames:
+                  try:
+                      if "Daily module" in f.content():
+                          return True
+                  except Exception:
+                      pass
+              return False
+
+          with sync_playwright() as p:
+              page = p.chromium.launch().new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+              time.sleep(10)
+              wake = page.get_by_role("button", name=re.compile("get this app back up", re.I))
+              if wake.count():
+                  print("The app was asleep: waking it up.")
+                  wake.first.click()
+              for _ in range(36):                       # up to 6 minutes for the app to start
+                  if app_is_up(page):
+                      print("The app is awake.")
+                      sys.exit(0)
+                  time.sleep(10)
+              sys.exit("The app did not come up within 6 minutes.")
+          EOF

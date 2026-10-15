@@ -1575,6 +1575,21 @@ def manage_tables() -> None:
             df[c] = to_dates(df[c])
         df["cancelled"] = [bool(x) for x in df["cancelled"]]
         df["owner"] = df["owner"].astype(str).str.strip()
+
+        # filters: find the projects to change
+        f1, f2, f3, f4 = st.columns([1.4, 1.2, 1.1, 1.6])
+        who = f1.multiselect("Person", sorted(df["owner"].unique()), placeholder="Everyone", key="m_f_person")
+        teams = f2.multiselect("Team", TEAMS, placeholder="All teams", key="m_f_team")
+        status = f3.selectbox("Status", ["All", "Open", "Overdue", "Closed", "Cancelled"], key="m_f_status")
+        q = f4.text_input("Search", placeholder="project name or ticket", key="m_f_q").strip().lower()
+        state = ["Cancelled" if c else ("Closed" if is_date(d) else ("Overdue" if u < today else "Open"))
+                 for c, d, u in zip(df["cancelled"], df["closed_on"], df["due_date"])]
+        keep = [(not who or o in who) and (not teams or TEAM_OF.get(o) in teams) and (status == "All" or s_ == status)
+                and (not q or q in str(t).lower() or q in str(k or "").lower())
+                for o, s_, t, k in zip(df["owner"], state, df["title"], df["jira_key"])]
+        total = len(df)
+        df = df[keep].reset_index(drop=True)
+        st.caption(f"{len(df)} of {total} projects")
         spec = {
             "table": "projects", "pk": "project_id",
             "required": ["user_id", "title", "start_date", "due_date"],
@@ -1594,7 +1609,9 @@ def manage_tables() -> None:
                 "created_at": st.column_config.DatetimeColumn("Created", format="DD/MM/YYYY HH:mm"),
             },
         }
-        editor(spec, df, lookups, "ed_projects")
+        # the grid's key follows the filters: unsaved edits are dropped when the filters change, never applied to the wrong rows
+        tag = hashlib.sha256(repr((who, teams, status, q)).encode()).hexdigest()[:8]
+        editor(spec, df, lookups, f"ed_projects_{tag}")
 
 
 if SECTION in ("Tickets", "My tickets"):

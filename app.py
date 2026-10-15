@@ -28,7 +28,6 @@ import deliverables as DL
 import ticket_flow as TF
 import ticket_kpis as KPI
 
-PRIORITIES = ["Critical", "High", "Medium", "Low"]          # Jira's priority names
 AUTO_SYNC_AFTER_MIN = 30                                      # catch up from Jira when the data is older than this
 APP_BUILD = "2026-10-09 d"                                   # shown in Jira diagnosis: tells which code is live
 
@@ -1132,10 +1131,11 @@ def health_tab() -> None:
         linked = linked[[TEAM_OF.get(n) in sel_team for n in linked["full_name"]]]
     ids = {int(u) for u in linked["user_id"]} if sel_team else None
     people_on = str(secret("app", "ticket_people_view", "true")).lower() in ("true", "1", "yes")
-    top, rest = render_health(model, label, months, today, SEE_ALL, people_on,
-                              f"synced {last.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}", ids)
+    key = last.isoformat()
+    months_key = tuple(str(m) for m in months)
+    top, rest = health_html(key, label, months_key, today, SEE_ALL, IS_ADMIN, people_on, tuple(sorted(ids)) if ids is not None else None)
     st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + HEALTH_CSS + top, unsafe_allow_html=True)
-    flow_section(flow_model(last.isoformat()), label, months, dict(zip(linked["jira_account_id"], linked["full_name"])), bool(sel_team))
+    flow_section(flow_tables(key, months_key, tuple(sorted(zip(linked["jira_account_id"], linked["full_name"]))), bool(sel_team)), label)
     st.markdown(CSS + METRIC_CSS + PEOPLE_CSS + HEALTH_CSS + rest, unsafe_allow_html=True)
 
 
@@ -1144,18 +1144,39 @@ def _section(title: str, note: str = "") -> None:
                 f'<span class="muted">{esc(note)}</span></div></div>', unsafe_allow_html=True)
 
 
-def flow_section(fm: dict | None, label: str, months: list[pd.Period], accounts: dict[str, str], team_only: bool) -> None:
-    """Assigned and resolved: over time, per person, and who is busy because of many tickets or because they keep them."""
+@st.cache_data(show_spinner="Working out the numbers...", max_entries=64)
+def health_html(sync_key: str, label: str, months_key: tuple, today_: dt.date, admin: bool, is_admin: bool, people_on: bool,
+                ids_key: tuple | None) -> tuple[str, str]:
+    """render_health for one period and team, kept until the next sync."""
+    months = [pd.Period(m, freq="M") for m in months_key]
+    synced = pd.Timestamp(sync_key).tz_convert(KPI.WORK_TZ)
+    return render_health(health_model(sync_key), label, months, today_, admin, people_on, f"synced {synced:%a %d %b %H:%M}",
+                         set(ids_key) if ids_key is not None else None)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def flow_tables(sync_key: str, months_key: tuple, accounts_key: tuple, team_only: bool):
+    """Per person and per month for one period and team, kept until the next sync. None before the people SQL."""
+    fm = flow_model(sync_key)
     if fm is None:
-        st.info("Run supabase_ticket_people.sql and a Full re-sync to see assigned and resolved per person.")
-        return
+        return None
+    months = [pd.Period(m, freq="M") for m in months_key]
+    accounts = dict(accounts_key)
     pp = TF.per_person(fm, set(months), accounts)
     if team_only:
         pp = pp[pp["person"] != TF.OTHERS]
-    keep = set(accounts) if team_only else None
     span = months if len(months) > 1 else list(pd.period_range(months[0] - 5, months[0], freq="M"))   # one month: show the 5 before too
-    pm = TF.per_month(fm, span, keep)
+    pm = TF.per_month(fm, span, set(accounts) if team_only else None)
     pm["label"] = [m.strftime("%b %y") for m in pm["month"]]
+    return pp, pm
+
+
+def flow_section(tables, label: str) -> None:
+    """Assigned and resolved: over time, per person, and who is busy because of many tickets or because they keep them."""
+    if tables is None:
+        st.info("Run supabase_ticket_people.sql and a Full re-sync to see assigned and resolved per person.")
+        return
+    pp, pm = tables
     tot = pp[["assigned", "resolved", "open_now"]].sum()
     _section("Assigned and resolved", f'{label} \u00b7 {int(tot["assigned"])} assigned \u00b7 {int(tot["resolved"])} resolved \u00b7 {int(tot["open_now"])} open now')
     st.altair_chart(CH.flow(pm), width="stretch")
@@ -1295,7 +1316,6 @@ if _out.button("Sign out", key="sign_out", width="stretch"):
 maybe_auto_sync()
 try:
     team = load()
-    tickets, report_date = load_tickets()
 except Exception as e:  # noqa: BLE001 - show any connection problem on the page
     st.error("Could not read from Supabase. Check [connections.supabase] in secrets.toml.")
     st.code(str(e).split("\n")[0])
@@ -1325,7 +1345,6 @@ if not SEE_ALL:
     if projects is not None:
         projects = projects[projects["owner"] == ME]
     team = where(team, team["name"] == ME)
-    tickets = where(tickets, tickets["assignee"] == ME)
     names = [ME]
 
 # The Deliverables team view lists only people who have projects.
@@ -1333,11 +1352,24 @@ _in_module = set(projects.loc[projects["outcome"] != "cancelled", "owner"]) if p
 MODULE_TEAM = where(team, [n in _in_module for n in team["name"]]) if SEE_ALL else team
 MODULE_NAMES = [str(n).strip() for n in MODULE_TEAM["name"]]
 
-_tab_names = (["Tickets", "Ticket health", "Deliverables"] + (["Manage"] if IS_ADMIN else [])) if SEE_ALL else ["My tickets", "Deliverables"]
-_tabs = dict(zip(_tab_names, st.tabs(_tab_names)))
-tab_tickets = _tabs["Tickets" if SEE_ALL else "My tickets"]
-tab_deliv = _tabs["Deliverables"]
-tab_health, tab_admin = _tabs.get("Ticket health"), _tabs.get("Manage")
+# Only the chosen section runs, so a click in one section never rebuilds the others.
+_SECTIONS = (["Tickets", "Ticket health", "Deliverables"] + (["Manage"] if IS_ADMIN else [])) if SEE_ALL else ["My tickets", "Deliverables"]
+SECTION = (st.segmented_control("Section", _SECTIONS, default=_SECTIONS[0], key="section", label_visibility="collapsed")
+           or st.session_state.get("_section_last", _SECTIONS[0]))      # clicking the open section again keeps it open
+st.session_state["_section_last"] = SECTION
+_LAST = last_sync_at()
+SYNC_KEY = _LAST.isoformat() if _LAST else ""
+
+
+@st.cache_data(show_spinner=False)
+def _tickets_for(sync_key: str) -> tuple[pd.DataFrame, dt.date]:
+    """Every ticket, read once per sync (saving in Manage clears it too)."""
+    return load_tickets()
+
+
+def get_tickets() -> tuple[pd.DataFrame, dt.date]:
+    t, report_date = _tickets_for(SYNC_KEY)
+    return (where(t, t["assignee"] == ME) if ME is not None else t), report_date
 
 
 def _project_done(err: str | None, ok: str) -> None:
@@ -1399,15 +1431,14 @@ def deliverables_tab() -> None:
     sel_team = st.columns([2, 3])[0].multiselect("Team", teams_here, placeholder="All teams", key="d_team")
     people = [(n, ini) for n, ini in zip(MODULE_TEAM["name"], MODULE_TEAM["initials"]) if not sel_team or TEAM_OF.get(n) in sel_team]
     shown = projects[projects["owner"].isin([n for n, _ in people])]
-    open_tk = tickets[tickets["state"] == "Open"].groupby("assignee").size().to_dict()
+    tk_all = get_tickets()[0]
+    open_tk = tk_all[tk_all["state"] == "Open"].groupby("assignee").size().to_dict()
     st.markdown(CSS + PEOPLE_CSS + DL.CSS + DL.team_view(shown, people, today, JIRA, TEAM_OF, open_tk), unsafe_allow_html=True)
     st.download_button("Download Excel", DL.excel(shown), file_name=f"Projects {today:%Y-%m-%d}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="d_xlsx")
 
-with tab_deliv:
-    deliverables_tab()
-
-with tab_tickets:
+def tickets_section() -> None:
+    tickets, report_date = get_tickets()
     tickets = tickets.copy()
     tickets["age"] = [((r if is_date(r) else report_date) - c).days if is_date(c) else 0
                       for c, r in zip(tickets["created"], tickets["resolved"])]
@@ -1473,19 +1504,8 @@ with tab_tickets:
         st.cache_data.clear()
         st.rerun()
 
-if tab_health is not None:
-    with tab_health:
-        try:
-            health_tab()
-        except Exception as e:  # noqa: BLE001 - keep the other tabs working
-            st.error(f"Ticket health could not be shown right now: {str(e).splitlines()[0][:200]}")
-
-
-if tab_admin is None:                                 # Manage is for the admin only, and it is the end of the page
-    st.stop()
-
-with tab_admin:
-    st.caption("Changes go straight to Supabase and appear on the other tabs after Save.")
+def manage_section() -> None:
+    st.caption("Changes go straight to Supabase and appear on the other sections after Save.")
 
     _state = _sync_state()
     with st.expander("Jira sync", expanded=bool(_state["running"])):
@@ -1533,143 +1553,58 @@ with tab_admin:
                 _lvl, _txt, _at = _state["outcome"]
                 {"error": st.error, "warning": st.warning}.get(_lvl, st.success)(f"{_txt} ({_at.astimezone(KPI.WORK_TZ):%d %b %H:%M})")
 
-    users_all = query("select user_id, full_name, initials, active, jira_account_id from users order by user_id")
-    users_all["active"] = users_all["active"].astype(bool)
-    name_to_id = {str(n): int(i) for i, n in zip(users_all["user_id"], users_all["full_name"])}
-    ticket_ids = [int(x) for x in tickets["number"].tolist()]
-    lookups = {"users": name_to_id, "assignee": {**name_to_id, "Unassigned": None}}
+    manage_tables()
 
-    which = st.radio("Table", ["Projects", "Tickets", "Users", "Teams", "Holidays", "Status map"], horizontal=True, key="admin_table")
 
-    if which == "Projects":
-        if projects is None:
-            st.info("Run supabase_projects.sql in Supabase first.")
-        else:
-            df = query("""
-                select p.project_id, u.full_name as owner, p.title, p.start_date, p.due_date, p.closed_on,
-                       p.jira_key, p.cancelled, p.created_at
-                from projects p join users u on u.user_id = p.user_id
-                order by p.project_id
-            """)
-            for c in ["start_date", "due_date", "closed_on"]:
-                df[c] = to_dates(df[c])
-            df["cancelled"] = [bool(x) for x in df["cancelled"]]
-            spec = {
-                "table": "projects", "pk": "project_id",
-                "required": ["user_id", "title", "start_date", "due_date"],
-                "kinds": {"project_id": "int", "owner": "text", "title": "text", "start_date": "date", "due_date": "date",
-                          "closed_on": "date", "jira_key": "text", "cancelled": "bool"},
-                "to_db": {"owner": ("user_id", "users")},
-                "disabled": ["project_id", "created_at"],
-                "config": {
-                    "project_id": st.column_config.NumberColumn("ID", width="small"),
-                    "owner": st.column_config.SelectboxColumn("Person", options=list(name_to_id), required=True),
-                    "title": st.column_config.TextColumn("Project", width="large", required=True, max_chars=200),
-                    "start_date": st.column_config.DateColumn("Start", format="DD/MM/YYYY", default=today, required=True),
-                    "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY", required=True),
-                    "closed_on": st.column_config.DateColumn("Closed", format="DD/MM/YYYY"),
-                    "jira_key": st.column_config.TextColumn("Ticket", help="Like MYDSUP-15908"),
-                    "cancelled": st.column_config.CheckboxColumn("Cancelled", default=False),
-                    "created_at": st.column_config.DatetimeColumn("Created", format="DD/MM/YYYY HH:mm"),
-                },
-            }
-            editor(spec, df, lookups, "ed_projects")
-
-    elif which == "Tickets":
+@st.fragment
+def manage_tables() -> None:
+    """Projects, with full access: edit any field, add rows, tick Delete to remove. A fragment: it reruns on its own."""
+    users_all = query("select user_id, full_name from users order by user_id")
+    name_to_id = {str(n).strip(): int(i) for i, n in zip(users_all["user_id"], users_all["full_name"])}
+    lookups = {"users": name_to_id}
+    if projects is None:
+        st.info("Run supabase_projects.sql in Supabase first.")
+    else:
         df = query("""
-            select t.ticket_id, t.summary, t.priority, coalesce(t.state, 'Open') as state,
-                   coalesce(u.full_name, 'Unassigned') as assignee, t.organization, t.created_on
-            from tickets t left join users u on u.user_id = t.assignee_id
-            order by t.ticket_id
+            select p.project_id, u.full_name as owner, p.title, p.start_date, p.due_date, p.closed_on,
+                   p.jira_key, p.cancelled, p.created_at
+            from projects p join users u on u.user_id = p.user_id
+            order by p.project_id
         """)
-        df["created_on"] = to_dates(df["created_on"])
+        for c in ["start_date", "due_date", "closed_on"]:
+            df[c] = to_dates(df[c])
+        df["cancelled"] = [bool(x) for x in df["cancelled"]]
+        df["owner"] = df["owner"].astype(str).str.strip()
         spec = {
-            "table": "tickets", "pk": "ticket_id",
-            "required": ["ticket_id", "summary"],
-            "kinds": {"ticket_id": "int", "summary": "text", "priority": "text", "state": "text", "assignee": "text",
-                      "organization": "text", "created_on": "date"},
-            "to_db": {"assignee": ("assignee_id", "assignee")},
+            "table": "projects", "pk": "project_id",
+            "required": ["user_id", "title", "start_date", "due_date"],
+            "kinds": {"project_id": "int", "owner": "text", "title": "text", "start_date": "date", "due_date": "date",
+                      "closed_on": "date", "jira_key": "text", "cancelled": "bool"},
+            "to_db": {"owner": ("user_id", "users")},
+            "disabled": ["project_id", "created_at"],
             "config": {
-                "ticket_id": st.column_config.NumberColumn("Number", format="%d", required=True, help="Jira number without the MYDSUP- prefix"),
-                "summary": st.column_config.TextColumn("Summary", width="large", required=True),
-                "priority": st.column_config.SelectboxColumn("Priority", options=PRIORITIES, default="Medium", required=True),
-                "state": st.column_config.SelectboxColumn("State", options=["Open", "Closed"], default="Open", required=True),
-                "assignee": st.column_config.SelectboxColumn("Assignee", options=list(name_to_id) + ["Unassigned"], default="Unassigned"),
-                "organization": st.column_config.TextColumn("Organization"),
-                "created_on": st.column_config.DateColumn("Created", format="DD/MM/YYYY", default=today),
+                "project_id": st.column_config.NumberColumn("ID", width="small"),
+                "owner": st.column_config.SelectboxColumn("Person", options=list(name_to_id), required=True),
+                "title": st.column_config.TextColumn("Project", width="large", required=True, max_chars=200),
+                "start_date": st.column_config.DateColumn("Start", format="DD/MM/YYYY", default=today, required=True),
+                "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY", required=True),
+                "closed_on": st.column_config.DateColumn("Closed", format="DD/MM/YYYY"),
+                "jira_key": st.column_config.TextColumn("Ticket", help="Like MYDSUP-15908"),
+                "cancelled": st.column_config.CheckboxColumn("Cancelled", default=False),
+                "created_at": st.column_config.DatetimeColumn("Created", format="DD/MM/YYYY HH:mm"),
             },
         }
-        editor(spec, df, lookups, "ed_tickets")
+        editor(spec, df, lookups, "ed_projects")
 
-    elif which == "Users":
-        spec = {
-            "table": "users", "pk": "user_id",
-            "required": ["full_name", "initials"],
-            "kinds": {"user_id": "int", "full_name": "text", "initials": "text", "active": "bool", "jira_account_id": "text"},
-            "disabled": ["user_id"],
-            "config": {
-                "user_id": st.column_config.NumberColumn("ID", width="small"),
-                "full_name": st.column_config.TextColumn("Full name", required=True),
-                "initials": st.column_config.TextColumn("Initials", max_chars=4, required=True),
-                "active": st.column_config.CheckboxColumn("Active", default=True),
-                "jira_account_id": st.column_config.TextColumn("Jira account", help="Jira account id; empty = not linked to Jira"),
-            },
-        }
-        users_ed = users_all
-        try:
-            teams_df = query("select team_id, name from teams order by coalesce(sort_order, 999), name")
-            users_ed = query("""select u.user_id, u.full_name, u.initials, t.name as team, u.active, u.jira_account_id
-                                from users u left join teams t on t.team_id = u.team_id order by u.user_id""")
-            users_ed["active"] = users_ed["active"].astype(bool)
-            lookups["teams"] = {str(n): int(i) for i, n in zip(teams_df["team_id"], teams_df["name"])}
-            spec["kinds"]["team"] = "text"
-            spec["to_db"] = {"team": ("team_id", "teams")}
-            spec["config"]["team"] = st.column_config.SelectboxColumn("Team", options=list(lookups["teams"]))
-        except Exception:  # noqa: BLE001 - before supabase_teams.sql: no Team column
-            st.caption("Run supabase_teams.sql in Supabase to give everyone a team.")
-        editor(spec, users_ed, lookups, "ed_users")
-        st.caption("A new person signs in once a [users.<username>] block with their full name is in the app secrets.")
 
-    elif which == "Teams":
-        try:
-            teams_df = query("select team_id, name, sort_order from teams order by coalesce(sort_order, 999), name")
-        except Exception:  # noqa: BLE001
-            st.info("Run supabase_teams.sql in Supabase first.")
-        else:
-            teams_df["sort_order"] = pd.to_numeric(teams_df["sort_order"], errors="coerce")
-            spec = {
-                "table": "teams", "pk": "team_id",
-                "required": ["name"],
-                "kinds": {"team_id": "int", "name": "text", "sort_order": "int"},
-                "disabled": ["team_id"],
-                "config": {
-                    "team_id": st.column_config.NumberColumn("ID", width="small"),
-                    "name": st.column_config.TextColumn("Team", required=True),
-                    "sort_order": st.column_config.NumberColumn("Order", min_value=0, step=1, help="Teams are listed in this order"),
-                },
-            }
-            editor(spec, teams_df, lookups, "ed_teams")
-
-    elif which in ("Holidays", "Status map"):
-        def _rebuild():                       # business hours and sides feed the ticket numbers: work them out again
-            health_model.clear()
-            flow_model.clear()
-        if which == "Holidays":
-            df = query("select day, note from holidays order by day")
-            df["day"] = to_dates(df["day"])
-            spec = {"table": "holidays", "pk": "day", "required": ["day"], "kinds": {"day": "date", "note": "text"},
-                    "config": {"day": st.column_config.DateColumn("Day", format="DD/MM/YYYY", required=True),
-                               "note": st.column_config.TextColumn("Note", width="large")}}
-            editor(spec, df, lookups, "ed_holidays", after_save=_rebuild)
-        else:
-            df = query("select status, side, note, delivered from jira_status_map order by status")
-            df["delivered"] = [bool(x) for x in df["delivered"]]
-            spec = {"table": "jira_status_map", "pk": "status", "required": ["status", "side"],
-                    "kinds": {"status": "text", "side": "text", "note": "text", "delivered": "bool"},
-                    "config": {"status": st.column_config.TextColumn("Jira status", required=True),
-                               "side": st.column_config.SelectboxColumn("Whose move", required=True,
-                                                                        options=["triage", "team", "client", "external", "release", "done"]),
-                               "note": st.column_config.TextColumn("Note", width="large"),
-                               "delivered": st.column_config.CheckboxColumn("Delivered", default=False,
-                                                                            help="The ticket counts as delivered in this status")}}
-            editor(spec, df, lookups, "ed_status", after_save=_rebuild)
+if SECTION in ("Tickets", "My tickets"):
+    tickets_section()
+elif SECTION == "Ticket health":
+    try:
+        health_tab()
+    except Exception as e:  # noqa: BLE001 - keep the page working
+        st.error(f"Ticket health could not be shown right now: {str(e).splitlines()[0][:200]}")
+elif SECTION == "Deliverables":
+    deliverables_tab()
+elif SECTION == "Manage" and IS_ADMIN:
+    manage_section()

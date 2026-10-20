@@ -91,8 +91,12 @@ def conn():
     return st.connection("supabase", type="sql", **kwargs)
 
 
+@st.cache_data(ttl=60)
 def query(sql: str) -> pd.DataFrame:
-    return conn().query(sql, ttl=60)
+    # Not conn().query(): it never closes its connection, which went back to the pool only when Python's garbage
+    # collector ran. The burst of queries after a sync clears the cache could use up the pool and hang the page and the sync.
+    with conn().engine.connect() as c:
+        return pd.read_sql(text(sql), c)
 
 
 def load() -> pd.DataFrame:
@@ -580,6 +584,8 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
             msg = "That row is still used elsewhere (for example a person who owns projects or tickets). For a person, untick Active instead."
         elif "duplicate key" in msg or "UNIQUE constraint" in msg:
             msg = "That value already exists in another row."
+        elif "projects_comment_length" in msg:
+            msg = f"Keep each comment under {DL.COMMENT_MAX} characters."
         return 0, msg
     return len(ops), None
 
@@ -1330,6 +1336,7 @@ try:
     projects = DL.classify(DL.load(query), today)
 except Exception:  # noqa: BLE001 - before supabase_projects.sql
     projects = None
+HAS_COMMENT = projects is not None and "comment_at" in projects.columns
 # the signed-in person's row in the users table (anyone can keep their own projects)
 USER_ID = next((int(u) for u, n in zip(team["user_id"], names) if ACCOUNT["name"] and n.lower() == ACCOUNT["name"].lower()), None)
 
@@ -1390,6 +1397,8 @@ def project_actions(mine: pd.DataFrame) -> None:
     open_ = mine[mine["outcome"].isin(["overdue", "upcoming"])]
     unlinked = open_[open_["jira_key"].map(lambda k: not (isinstance(k, str) and k)).astype(bool)]
     name_of = {int(r.project_id): f"{r.title} \u00b7 due {DL.fmt(r.due_date)}" for r in mine.itertuples()}
+    twice = {v for v in name_of.values() if list(name_of.values()).count(v) > 1}
+    name_of = {k: v + (f" \u00b7 #{k}" if v in twice else "") for k, v in name_of.items()}   # labels must be unique
     a, b, c = st.columns(3)
     with a.popover("Add project", icon=":material/add:", width="stretch"):
         with st.form("p_add", clear_on_submit=True, border=False):
@@ -1410,6 +1419,53 @@ def project_actions(mine: pd.DataFrame) -> None:
         key = st.text_input("Ticket", placeholder="MYDSUP-15908", key="p_link_key")
         if st.button("Link", type="primary", width="stretch", key="p_link_go"):
             _project_done(DL.link(conn(), pid, USER_ID, key), "Ticket linked.")
+
+
+def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
+    """Open projects with dates, ticket and comment. On your own projects a second small table, project and comment
+    only, to write the comments (one per project) without the dates pushing the comment off to the right."""
+    msg = st.session_state.pop("_cm_msg", None)
+    if msg:
+        st.success(msg)
+    op = mine[mine["outcome"].isin(["overdue", "upcoming"])].sort_values(["due_date", "project_id"])
+    _section("Open projects", f"{len(op)} now")
+    if op.empty:
+        return
+    view = pd.DataFrame({"Project": op["title"].tolist(), "Start": op["start_date"].tolist(), "Due": op["due_date"].tolist(),
+                         "Ticket": [f"{JIRA}/browse/{k}" if isinstance(k, str) and k else "" for k in op["jira_key"]]})
+    if HAS_COMMENT:
+        view["Comment"] = [c if isinstance(c, str) else "" for c in op["comment"]]
+    st.dataframe(view, hide_index=True, width="stretch", key=f"{key}_open",
+                 column_config={"Project": st.column_config.TextColumn("Project", width="medium"),
+                                "Start": st.column_config.DateColumn("Start", format="DD/MM/YYYY"),
+                                "Due": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),
+                                "Ticket": st.column_config.LinkColumn("Ticket", display_text=r".*/browse/(.*)"),
+                                "Comment": st.column_config.TextColumn("Comment", width="large")})
+    if not (own and HAS_COMMENT and USER_ID is not None):
+        return
+    _section("Your comments", "one per project")
+    base = pd.DataFrame({"project_id": op["project_id"].astype(int).tolist(), "Project": op["title"].tolist(),
+                         "Comment": [c if isinstance(c, str) else "" for c in op["comment"]]})
+    # the key follows the projects and the saved comments: an unsaved edit never lands on another project, and after a
+    # save (or a change by the admin) the table starts afresh from what is stored
+    ek = f"{key}_cm_{hashlib.sha256(repr((tuple(base['project_id']), tuple(base['Comment']))).encode()).hexdigest()[:8]}"
+    edited = st.data_editor(base, key=ek, hide_index=True, width="stretch", num_rows="fixed",
+                            column_order=["Project", "Comment"], disabled=["project_id", "Project"],
+                            column_config={"Project": st.column_config.TextColumn("Project", width="medium"),
+                                           "Comment": st.column_config.TextColumn("Comment", width="large",
+                                                                                  max_chars=DL.COMMENT_MAX)})
+    changes = {int(pid): c for pid, c, was in zip(edited["project_id"], edited["Comment"], base["Comment"])
+               if DL.clean_comment(c) != DL.clean_comment(was)}
+    if st.button(f"Save {plural(len(changes), 'comment')}" if changes else "Save", type="primary",
+                 disabled=not changes, key=ek + "_save"):
+        err = DL.set_comments(conn(), USER_ID, changes)
+        if err:
+            st.error(err)
+            return
+        st.cache_data.clear()
+        del st.session_state[ek]
+        st.session_state["_cm_msg"] = "Comments saved."
+        st.rerun()
 
 
 def deliverables_tab() -> None:
@@ -1434,6 +1490,7 @@ def deliverables_tab() -> None:
         elif own:
             st.info("Your sign-in is not linked to a person in the users table, so you have no projects.")
         st.markdown(CSS + PEOPLE_CSS + DL.CSS + DL.my_view(mine, today, JIRA), unsafe_allow_html=True)
+        open_projects(mine, own, "d")
         return
     teams_here = list(dict.fromkeys(TEAM_OF[n] for n in MODULE_NAMES if TEAM_OF.get(n)))
     sel_team = st.columns([2, 3])[0].multiselect("Team", teams_here, placeholder="All teams", key="d_team")
@@ -1444,6 +1501,7 @@ def deliverables_tab() -> None:
     st.markdown(CSS + PEOPLE_CSS + DL.CSS + DL.team_view(shown, people, today, JIRA, TEAM_OF, open_tk), unsafe_allow_html=True)
     st.download_button("Download Excel", DL.excel(shown), file_name=f"Projects {today:%Y-%m-%d}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="d_xlsx")
+
 
 def tickets_section() -> None:
     tickets, report_date = get_tickets()
@@ -1573,9 +1631,9 @@ def manage_tables() -> None:
     if projects is None:
         st.info("Run supabase_projects.sql in Supabase first.")
     else:
-        df = query("""
+        df = query(f"""
             select p.project_id, u.full_name as owner, p.title, p.start_date, p.due_date, p.closed_on,
-                   p.jira_key, p.cancelled, p.created_at
+                   p.jira_key, {"p.comment," if HAS_COMMENT else ""} p.cancelled, p.created_at
             from projects p join users u on u.user_id = p.user_id
             order by p.project_id
         """)
@@ -1589,12 +1647,13 @@ def manage_tables() -> None:
         who = f1.multiselect("Person", sorted(df["owner"].unique()), placeholder="Everyone", key="m_f_person")
         teams = f2.multiselect("Team", TEAMS, placeholder="All teams", key="m_f_team")
         status = f3.selectbox("Status", ["All", "Open", "Overdue", "Closed", "Cancelled"], key="m_f_status")
-        q = f4.text_input("Search", placeholder="project name or ticket", key="m_f_q").strip().lower()
+        q = f4.text_input("Search", placeholder="project, ticket or comment", key="m_f_q").strip().lower()
         state = ["Cancelled" if c else ("Closed" if is_date(d) else ("Overdue" if u < today else "Open"))
                  for c, d, u in zip(df["cancelled"], df["closed_on"], df["due_date"])]
         keep = [(not who or o in who) and (not teams or TEAM_OF.get(o) in teams) and (status == "All" or s_ == status)
-                and (not q or q in str(t).lower() or q in str(k or "").lower())
-                for o, s_, t, k in zip(df["owner"], state, df["title"], df["jira_key"])]
+                and (not q or q in str(t).lower() or q in str(k or "").lower() or q in str(m or "").lower())
+                for o, s_, t, k, m in zip(df["owner"], state, df["title"], df["jira_key"],
+                                          df["comment"] if HAS_COMMENT else [None] * len(df))]
         total = len(df)
         df = df[keep].reset_index(drop=True)
         st.caption(f"{len(df)} of {total} projects")
@@ -1602,7 +1661,7 @@ def manage_tables() -> None:
             "table": "projects", "pk": "project_id",
             "required": ["user_id", "title", "start_date", "due_date"],
             "kinds": {"project_id": "int", "owner": "text", "title": "text", "start_date": "date", "due_date": "date",
-                      "closed_on": "date", "jira_key": "text", "cancelled": "bool"},
+                      "closed_on": "date", "jira_key": "text", "cancelled": "bool", **({"comment": "text"} if HAS_COMMENT else {})},
             "to_db": {"owner": ("user_id", "users")},
             "disabled": ["project_id", "created_at"],
             "config": {
@@ -1613,6 +1672,7 @@ def manage_tables() -> None:
                 "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY", required=True),
                 "closed_on": st.column_config.DateColumn("Closed", format="DD/MM/YYYY"),
                 "jira_key": st.column_config.TextColumn("Ticket", help="Like MYDSUP-15908"),
+                "comment": st.column_config.TextColumn("Comment", width="large", max_chars=DL.COMMENT_MAX),
                 "cancelled": st.column_config.CheckboxColumn("Cancelled", default=False),
                 "created_at": st.column_config.DatetimeColumn("Created", format="DD/MM/YYYY HH:mm"),
             },
@@ -1674,6 +1734,7 @@ def dashboard_section() -> None:
     if mine is not None:
         _section("Projects")
         st.markdown(CSS + PEOPLE_CSS + DL.CSS + DL.my_view(mine, today, JIRA), unsafe_allow_html=True)
+        open_projects(mine, person.lower() == me, "db")
 
     fm = flow_model(SYNC_KEY) if acc and SYNC_KEY else None
     if fm is not None:

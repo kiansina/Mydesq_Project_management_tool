@@ -113,16 +113,23 @@ To replace the password with real single sign-on later, Streamlit supports
 
 Run `supabase_projects.sql` in the Supabase SQL Editor before deploying (part A is a check, part B creates the
 `projects` table, its rules and copies every old deliverable; part C, later, retires the old table). Optionally run
-`supabase_projects_selftest.sql`: it tries every rule and undoes everything.
+`supabase_projects_selftest.sql`: it tries every rule and undoes everything. Then run `supabase_project_comment.sql`
+(one comment per project; optionally `supabase_project_comment_selftest.sql`). If you ever run `supabase_projects.sql`
+again, run `supabase_project_comment.sql` again after it.
 
 * A project has three dates: created (set by the database), start and due. **The due date is final.** A late project
   shows `+N d` and is never re-dated.
-* A person can add projects, close them (always today) and link a ticket once. Nothing else can change.
-  The database refuses anything else, whatever the screen sends.
-* The admin edits, cancels or deletes in Manage > Projects. Cancelled projects never count.
+* A person can add projects, close them (always today), link a ticket once and keep one comment per project
+  (for example "waiting for the other team"; it can be changed any time). Nothing else can change.
+  The database refuses anything else, whatever the screen sends, and dates each comment itself.
+* Click a project on the timeline (Dashboard or Deliverables) to see its start, due, ticket and comment.
+  Below the timeline, **Open projects** lists start, due, ticket and comment; on your own projects,
+  **Your comments** (project and comment only) is where you write them.
+* The admin edits, cancels or deletes in Manage > Projects, comments included. Cancelled projects never count.
 * **My projects**: open, overdue, kept % and closed late, plus a start-to-due timeline (red tail = days past due).
 * **Team** (managers and admin): the same tiles, Keeping commitments (one square per closed or past-due project),
-  On their plate (open projects next to open tickets), Due by week, the overdue list and an Excel download.
+  On their plate (open projects next to open tickets), Due by week, the overdue list (with each comment) and an
+  Excel download (with the comments).
 * Kept = closed on or before the due date. Labels start at 4 settled projects: 80% or more kept is good;
   under 60% with at least 3 not kept needs support.
 

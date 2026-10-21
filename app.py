@@ -1422,8 +1422,8 @@ def project_actions(mine: pd.DataFrame) -> None:
 
 
 def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
-    """Open projects with dates, ticket and comment. On your own projects a second small table, project and comment
-    only, to write the comments (one per project) without the dates pushing the comment off to the right."""
+    """Open projects with dates, ticket and comment. On your own projects the Comment column is editable (one comment
+    per project); everyone else sees the same table read-only."""
     msg = st.session_state.pop("_cm_msg", None)
     if msg:
         st.success(msg)
@@ -1431,30 +1431,26 @@ def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
     _section("Open projects", f"{len(op)} now")
     if op.empty:
         return
-    view = pd.DataFrame({"Project": op["title"].tolist(), "Start": op["start_date"].tolist(), "Due": op["due_date"].tolist(),
+    view = pd.DataFrame({"project_id": op["project_id"].astype(int).tolist(), "Project": op["title"].tolist(),
+                         "Start": op["start_date"].tolist(), "Due": op["due_date"].tolist(),
                          "Ticket": [f"{JIRA}/browse/{k}" if isinstance(k, str) and k else "" for k in op["jira_key"]]})
     if HAS_COMMENT:
         view["Comment"] = [c if isinstance(c, str) else "" for c in op["comment"]]
-    st.dataframe(view, hide_index=True, width="stretch", key=f"{key}_open",
-                 column_config={"Project": st.column_config.TextColumn("Project", width="medium"),
-                                "Start": st.column_config.DateColumn("Start", format="DD/MM/YYYY"),
-                                "Due": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),
-                                "Ticket": st.column_config.LinkColumn("Ticket", display_text=r".*/browse/(.*)"),
-                                "Comment": st.column_config.TextColumn("Comment", width="large")})
+    config = {"Project": st.column_config.TextColumn("Project", width="medium"),
+              "Start": st.column_config.DateColumn("Start", format="DD/MM/YYYY"),
+              "Due": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),
+              "Ticket": st.column_config.LinkColumn("Ticket", display_text=r".*/browse/(.*)"),
+              "Comment": st.column_config.TextColumn("Comment", width="large", max_chars=DL.COMMENT_MAX)}
     if not (own and HAS_COMMENT and USER_ID is not None):
+        st.dataframe(view.drop(columns="project_id"), hide_index=True, width="stretch", key=f"{key}_open", column_config=config)
         return
-    _section("Your comments", "one per project")
-    base = pd.DataFrame({"project_id": op["project_id"].astype(int).tolist(), "Project": op["title"].tolist(),
-                         "Comment": [c if isinstance(c, str) else "" for c in op["comment"]]})
     # the key follows the projects and the saved comments: an unsaved edit never lands on another project, and after a
     # save (or a change by the admin) the table starts afresh from what is stored
-    ek = f"{key}_cm_{hashlib.sha256(repr((tuple(base['project_id']), tuple(base['Comment']))).encode()).hexdigest()[:8]}"
-    edited = st.data_editor(base, key=ek, hide_index=True, width="stretch", num_rows="fixed",
-                            column_order=["Project", "Comment"], disabled=["project_id", "Project"],
-                            column_config={"Project": st.column_config.TextColumn("Project", width="medium"),
-                                           "Comment": st.column_config.TextColumn("Comment", width="large",
-                                                                                  max_chars=DL.COMMENT_MAX)})
-    changes = {int(pid): c for pid, c, was in zip(edited["project_id"], edited["Comment"], base["Comment"])
+    ek = f"{key}_cm_{hashlib.sha256(repr((tuple(view['project_id']), tuple(view['Comment']))).encode()).hexdigest()[:8]}"
+    edited = st.data_editor(view, key=ek, hide_index=True, width="stretch", num_rows="fixed", column_config=config,
+                            column_order=["Project", "Start", "Due", "Ticket", "Comment"],
+                            disabled=["project_id", "Project", "Start", "Due", "Ticket"])
+    changes = {int(pid): c for pid, c, was in zip(edited["project_id"], edited["Comment"], view["Comment"])
                if DL.clean_comment(c) != DL.clean_comment(was)}
     if st.button(f"Save {plural(len(changes), 'comment')}" if changes else "Save", type="primary",
                  disabled=not changes, key=ek + "_save"):

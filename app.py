@@ -79,7 +79,7 @@ def plural(n: int, word: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Data (read-only queries; results cached for 60 s, cleared after every save)
+# Data (read-only queries; results kept 10 minutes, cleared after every save and every Jira sync)
 # ----------------------------------------------------------------------------
 def conn():
     # pool_pre_ping drops stale pooled connections (Supabase's pooler closes idle ones);
@@ -91,7 +91,7 @@ def conn():
     return st.connection("supabase", type="sql", **kwargs)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=600, show_spinner=False)
 def query(sql: str) -> pd.DataFrame:
     # Not conn().query(): it never closes its connection, which went back to the pool only when Python's garbage
     # collector ran. The burst of queries after a sync clears the cache could use up the pool and hang the page and the sync.
@@ -134,6 +134,25 @@ def _sync_state() -> dict:
     return {"lock": threading.Lock(), "last_try": None, "running": None, "started": None, "progress": "", "outcome": None}
 
 
+def _warm_up() -> None:
+    """Right after a sync, build the heavy figures for the new data in the background (tickets, their history lines,
+    ticket flow and ticket health), so the first page opened afterwards does not wait for them. Only a head start:
+    a page that comes first builds them itself."""
+    last = last_sync_at()
+    if last is None:
+        return
+    key, g = last.isoformat(), globals()          # the page's own functions, defined further down
+    for name in ("_tickets_for", "ticket_lines", "flow_model", "health_model"):
+        f = g.get(name)
+        if f is None:
+            continue
+        try:
+            f(key)
+        except Exception:  # noqa: BLE001 - a page builds it when needed
+            pass
+    _sync_state()["warmed"] = key
+
+
 def start_sync(mode: str) -> bool:
     """Start an incremental or full sync in the background; False when one is already running."""
     state = _sync_state()
@@ -149,6 +168,7 @@ def start_sync(mode: str) -> bool:
     def work():
         from jira_client import Jira
         from jira_sync import run_sync
+        done = False
         try:
             res = run_sync(engine, Jira.from_mapping(cfg), mode, log=log)
             p = res.get("partial")
@@ -156,12 +176,15 @@ def start_sync(mode: str) -> bool:
                                             "were left as they are. Press Check connection.") if p else
                                 ("success", f"{mode.capitalize()} sync finished: {res['tickets']} tickets refreshed in {res['seconds']:.0f} s."))
             st.cache_data.clear()
+            done = True
         except BaseException as e:  # noqa: BLE001 - background: record and move on
             state["outcome"] = ("error", f"{mode.capitalize()} sync failed: " + (str(e).splitlines()[0][:200] if str(e) else type(e).__name__))
         finally:
             state["outcome"] = (*state["outcome"][:2], dt.datetime.now(dt.timezone.utc)) if state["outcome"] else None
             state["running"] = None
             state["lock"].release()
+        if done:
+            _warm_up()                              # after the lock: the buttons are free again meanwhile
 
     threading.Thread(target=work, daemon=True).start()
     return True

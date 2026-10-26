@@ -23,6 +23,7 @@ import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+import achievements as AC
 import charts as CH
 import deliverables as DL
 import ticket_flow as TF
@@ -1360,6 +1361,7 @@ try:
 except Exception:  # noqa: BLE001 - before supabase_projects.sql
     projects = None
 HAS_COMMENT = projects is not None and "comment_at" in projects.columns
+ACH = AC.load(query)                                   # None until supabase_achievements.sql has run
 # the signed-in person's row in the users table (anyone can keep their own projects)
 USER_ID = next((int(u) for u, n in zip(team["user_id"], names) if ACCOUNT["name"] and n.lower() == ACCOUNT["name"].lower()), None)
 
@@ -1374,8 +1376,11 @@ if not SEE_ALL:
     # a user sees only their own work: every tab below is built from these tables
     if projects is not None:
         projects = projects[projects["owner"] == ME]
+    if ACH is not None:
+        ACH = ACH[ACH["owner"] == ME]
     team = where(team, team["name"] == ME)
     names = [ME]
+USER_OF = {n: int(u) for n, u in zip(names, team["user_id"])}      # person -> user_id
 
 # The Deliverables team view lists only people who have projects.
 _in_module = set(projects.loc[projects["outcome"] != "cancelled", "owner"]) if projects is not None else set()
@@ -1701,6 +1706,64 @@ def manage_tables() -> None:
         editor(spec, df, lookups, f"ed_projects_{tag}")
 
 
+def _ach_done(err: str | None, ok: str) -> None:
+    if err:
+        st.error(err)
+        return
+    st.cache_data.clear()
+    st.session_state["_ach_msg"] = ok
+    st.rerun()
+
+
+def achievements_part(person: str, months: list, label: str, own: bool) -> None:
+    """Successes and positive impact the person recorded in the period: date, title, comment. Their own (and the admin)
+    can add, edit and delete; everyone else reads. Documents stay with the person."""
+    if ACH is None:
+        return
+    uid = USER_ID if own else USER_OF.get(person)
+    can = uid is not None and (own or IS_ADMIN)
+    keep = {str(m) for m in months}
+    shown = ACH[[o == person and d is not None and d.strftime("%Y-%m") in keep for o, d in zip(ACH["owner"], ACH["achieved_on"])]]
+    _section("Achievements", f"{len(shown)} in {label}")
+    msg = st.session_state.pop("_ach_msg", None)
+    if msg:
+        st.success(msg)
+    if can:
+        with st.popover("Add achievement", icon=":material/add:"):
+            with st.form("ach_add", clear_on_submit=True, border=False):
+                title = st.text_input("Achievement", max_chars=AC.TITLE_MAX)
+                day = st.date_input("When", value=today, min_value=AC.FIRST_DAY, max_value=today, format="DD/MM/YYYY")
+                note = st.text_area("Comment (optional)", max_chars=AC.COMMENT_MAX, height=90)
+                if st.form_submit_button("Add", type="primary", width="stretch"):
+                    _ach_done(AC.add(conn(), uid, title, day, note, ACCOUNT["user"], today), "Achievement added.")
+    if shown.empty:
+        return
+    view = pd.DataFrame({"achievement_id": shown["achievement_id"].astype(int).tolist(), "When": shown["achieved_on"].tolist(),
+                         "Achievement": shown["title"].tolist(),
+                         "Comment": [c if isinstance(c, str) else "" for c in shown["comment"]]})
+    config = {"When": st.column_config.DateColumn("When", format="DD/MM/YYYY", min_value=AC.FIRST_DAY, max_value=today, required=True),
+              "Achievement": st.column_config.TextColumn("Achievement", width="medium", required=True, max_chars=AC.TITLE_MAX),
+              "Comment": st.column_config.TextColumn("Comment", width="medium", max_chars=AC.COMMENT_MAX)}
+    if not can:
+        st.dataframe(view.drop(columns="achievement_id"), hide_index=True, width="stretch", key="ach_view", column_config=config)
+        return
+    view["Delete"] = False
+    config["Delete"] = st.column_config.CheckboxColumn("Delete", width="small", help="Tick, then Save, to remove it")
+    # the key follows what is stored: after a save, or a change elsewhere, the table starts afresh
+    ek = "ach_" + hashlib.sha256(repr([tuple(view[c]) for c in ("achievement_id", "When", "Achievement", "Comment")]).encode()).hexdigest()[:8]
+    edited = st.data_editor(view, key=ek, hide_index=True, width="stretch", num_rows="fixed", column_config=config,
+                            column_order=["Delete", "When", "Achievement", "Comment"], disabled=["achievement_id"])
+    deletes = [int(i) for i, d in zip(edited["achievement_id"], edited["Delete"]) if d]
+    edits = {int(i): (t, c, w) for i, t, c, w, d, t0, c0, w0 in zip(edited["achievement_id"], edited["Achievement"], edited["Comment"],
+                                                                     edited["When"], edited["Delete"], view["Achievement"],
+                                                                     view["Comment"], view["When"])
+             if not d and (AC.clean(t) != AC.clean(t0) or AC.clean(c) != AC.clean(c0) or AC._day(w) != AC._day(w0))}
+    n = len(edits) + len(deletes)
+    label_ = f"Save {plural(n, 'change')}" + (f" ({len(deletes)} to delete)" if deletes else "") if n else "Save"
+    if st.button(label_, type="primary", disabled=not n, key=ek + "_save"):
+        _ach_done(AC.save(conn(), uid, edits, deletes, today), "Achievements saved.")
+
+
 def dashboard_section() -> None:
     """One person's page: their tickets for a period, their projects, their open tickets.
     A user sees their own; managers and the admin choose anyone (view only)."""
@@ -1774,6 +1837,8 @@ def dashboard_section() -> None:
                                "Summary": st.column_config.TextColumn("Summary", width="large"),
                                "With them since": st.column_config.DateColumn("With them since", format="DD/MM/YYYY"),
                                "Days held": st.column_config.NumberColumn("Days held", help="Business days since they received it")})
+
+    achievements_part(person, months, label, person.lower() == me)
 
 
 if SECTION == "Dashboard":

@@ -122,9 +122,14 @@ again, run `supabase_project_comment.sql` again after it.
 * A person can add projects, close them (always today), link a ticket once and keep one comment per project
   (for example "waiting for the other team"; it can be changed any time). Nothing else can change.
   The database refuses anything else, whatever the screen sends, and dates each comment itself.
+* **Updated due**: the original due date stays the commitment. In Open projects a person can set an updated due date
+  (open projects only, not in the past, never removed); every move is logged (`project_due_changes`) and counted as
+  "re-dated" on the tiles, the Team view and the Excel download, because moving a date means a commitment not kept.
+  Kept / late is still measured against the original due date. Run `supabase_project_redate.sql` (after
+  `supabase_project_comment.sql`; optionally `supabase_project_redate_selftest.sql`).
 * Click a project on the timeline (Dashboard or Deliverables) to see its start, due, ticket and comment.
-  Below the timeline, **Open projects** lists start, due, ticket and comment; on your own projects,
-  **Your comments** (project and comment only) is where you write them.
+  Below the timeline, **Open projects** lists start, due, ticket and comment; on your own projects the
+  Comment column is editable (type, then Save).
 * The admin edits, cancels or deletes in Manage > Projects, comments included. Cancelled projects never count.
 * **My projects**: open, overdue, kept % and closed late, plus a start-to-due timeline (red tail = days past due).
 * **Team** (managers and admin): the same tiles, Keeping commitments (one square per closed or past-due project),
@@ -132,6 +137,13 @@ again, run `supabase_project_comment.sql` again after it.
   Excel download (with the comments).
 * Kept = closed on or before the due date. Labels start at 4 settled projects: 80% or more kept is good;
   under 60% with at least 3 not kept needs support.
+
+### Achievements (Dashboard)
+
+Run `supabase_achievements.sql` once. On the Dashboard each person records successes or positive impact: a title,
+a date (not in the future) and an optional comment. Documents and screenshots stay with the person; the team head
+asks for them when needed. A person adds, edits and deletes their own (the admin anyone's); managers read them. The
+list follows the Dashboard's period.
 
 ## 7. Jira sync and Ticket health
 

@@ -2,9 +2,10 @@
 
 A project has three dates: created (set by the database), start, and due. The due date is fixed for ever:
 a late project shows how many days it is past due and is never re-dated. A person can only add projects,
-close them (always today), link a ticket once and keep one comment on each (for example "waiting for the other team");
-the admin edits everything in Manage. The database trigger (supabase_projects.sql, then supabase_project_comment.sql)
-enforces the same rules, so the screens cannot get round them.
+close them (always today), link a ticket once, keep one comment on each (for example "waiting for the other team") and
+set an updated due date: the original due date stays as the commitment, and every move of the updated date is logged
+(a sign of a commitment not kept). The admin edits everything in Manage. The database triggers (supabase_projects.sql,
+supabase_project_comment.sql, supabase_project_redate.sql) enforce the same rules, so the screens cannot get round them.
 """
 from __future__ import annotations
 
@@ -46,6 +47,7 @@ CSS = """
 .dm .gl.closed{opacity:.55}
 .dm .gbar{position:absolute;top:4px;height:10px;border-radius:2px}
 .dm .g-open{background:#2a78d6}.dm .g-over{background:#e24b4a}.dm .g-kept{background:#639922}.dm .g-late{background:#eda100}
+.dm .g-rev{background:repeating-linear-gradient(135deg,#eda100 0 3px,#fbe3b0 3px 6px)}.dm .g-rev.thin{top:7px;height:4px}
 .dm .glbl{position:absolute;top:1px;font-size:11px;white-space:nowrap;color:var(--t2)}.dm .glbl.r{color:#a32d2d;font-weight:500}
 .dm .kchip{display:inline-block;font-size:11px;padding:0 6px;border-radius:6px;background:var(--s1);color:var(--t2);margin-left:4px;white-space:nowrap}
 .dm .heat td.c{text-align:center;font-size:12px;font-variant-numeric:tabular-nums}
@@ -103,20 +105,47 @@ def load(query) -> pd.DataFrame:
         left join tickets t on t.jira_key = p.jira_key
         order by p.due_date, p.project_id
     """
-    if {"comment", "comment_at"} <= set(query("select * from projects where 1 = 0").columns):
-        df = query(sql.format(extra="p.comment, p.comment_at,"))
+    cols = columns(query)
+    df = query(sql.format(extra=("p.comment, p.comment_at, " if {"comment", "comment_at"} <= cols else "")
+                               + ("p.revised_due, " if "revised_due" in cols else "")))
+    if "comment_at" in df.columns:
         df["comment_at"] = pd.to_datetime(df["comment_at"], errors="coerce", utc=True).dt.tz_convert(ROME)
     else:                                   # before supabase_project_comment.sql
-        df = query(sql.format(extra=""))
         df["comment"] = None
+    if "revised_due" not in df.columns:     # before supabase_project_redate.sql
+        df["revised_due"] = None
     # text or None, kept as plain objects (with pandas 3 a text column would turn None into NaN)
     df["comment"] = pd.Series([" ".join(x.split()) if isinstance(x, str) and x.strip() else None for x in df["comment"]],
                               index=df.index, dtype=object)
-    for c in ("start_date", "due_date", "closed_on"):
-        df[c] = [d.date() if is_date(d) else None for d in pd.to_datetime(df[c], errors="coerce")]
+    for c in ("start_date", "due_date", "closed_on", "revised_due"):
+        df[c] = pd.Series([as_date(d) for d in df[c]], index=df.index, dtype=object)
     df["owner"] = df["owner"].astype(str).str.strip()
     df["cancelled"] = [bool(x) for x in df["cancelled"]]
+    # every move of the updated due date: [(from, to, changed on)], oldest first
+    hist: dict[int, list] = {}
+    if "revised_due" in cols:
+        try:
+            log = query("select project_id, old_due, new_due, changed_at from project_due_changes order by changed_at, change_id")
+            for r in log.itertuples():
+                hist.setdefault(int(r.project_id), []).append((as_date(r.old_due), as_date(r.new_due), _local_date(r.changed_at)))
+        except Exception:  # noqa: BLE001 - the log arrives with the same script; never block the page on it
+            pass
+    df["due_log"] = pd.Series([hist.get(int(i), []) for i in df["project_id"]], index=df.index, dtype=object)
+    df["redates"] = [len(x) for x in df["due_log"]]
     return df
+
+
+def columns(query) -> set:
+    """The projects table's columns (comment and updated due date arrive with their SQL scripts)."""
+    return set(query("select * from projects where 1 = 0").columns)
+
+
+def as_date(v) -> dt.date | None:
+    """A date from the database or a table cell (date, timestamp or text) as a date; None when empty."""
+    try:
+        return None if v is None or pd.isna(v) else pd.Timestamp(v).date()
+    except (TypeError, ValueError):
+        return None
 
 
 def classify(df: pd.DataFrame, today: dt.date) -> pd.DataFrame:
@@ -147,9 +176,11 @@ def stats(c: pd.DataFrame, today: dt.date) -> dict:
     settled = kept + late + over
     soon = sum(1 for oc, n in zip(o, c["days"]) if oc == "upcoming" and n is not None and n <= SOON_DAYS)
     past = [int(n) for oc, n in zip(o, c["days"]) if oc == "overdue"]
+    moves = [int(x) for oc, x in zip(o, c["redates"]) if oc != "cancelled"] if "redates" in c.columns else []
     return {"kept": kept, "late": late, "overdue": over, "upcoming": up, "settled": settled, "missed": late + over,
             "open": over + up, "soon": soon, "max_over": max(past) if past else 0,
-            "kept_pct": round(100 * kept / settled) if settled else None}
+            "kept_pct": round(100 * kept / settled) if settled else None,
+            "redated": sum(1 for x in moves if x), "redates": sum(moves)}
 
 
 def verdict(kept: int, settled: int) -> tuple[str, str]:
@@ -170,6 +201,9 @@ def _reason(e: SQLAlchemyError) -> str:
     msg = str(getattr(e, "orig", e)).split("\n")[0]
     for known in ("Due date cannot be in the past", "Only closing or linking a ticket is allowed",
                   "Only closing, linking a ticket or the comment can change",
+                  "Only closing, linking a ticket, the comment or the updated due date can change",
+                  "A closed project cannot get a new due date", "An updated due date cannot be removed",
+                  "The updated due date cannot be in the past", "The updated due date must be on or after the start date",
                   "A closed project cannot be reopened or re-dated", "The ticket can be linked once",
                   "Projects cannot be deleted", "This project is cancelled"):
         if known in msg:
@@ -204,17 +238,42 @@ def clean_comment(value) -> str | None:
 
 def set_comments(conn, user_id: int, changes: dict) -> str | None:
     """Save the comments of the person's own projects (one per project, empty clears it), all or nothing."""
-    rows = [{"c": clean_comment(v), "p": int(k), "u": int(user_id)} for k, v in changes.items()]
+    return save_open(conn, user_id, changes, {}, None)
+
+
+def save_open(conn, user_id: int, comments: dict, dues: dict, today: dt.date | None, by: str | None = None) -> str | None:
+    """Comments and updated due dates of the person's own projects, all or nothing. The original due date never changes;
+    an updated due date is for open projects, not in the past, not before the start, and is never removed. The database
+    logs every move (with `by`, the sign-in name)."""
+    rows = [{"c": clean_comment(v), "p": int(k), "u": int(user_id)} for k, v in comments.items()]
     if any(r["c"] and len(r["c"]) > COMMENT_MAX for r in rows):
         return f"Keep each comment under {COMMENT_MAX} characters."
+    nope = "Nothing saved: one of the projects is not yours or is cancelled."
     try:
         with conn.session as s:
+            if by and s.get_bind().dialect.name == "postgresql":
+                s.execute(text("select set_config('app.user', :by, true)"), {"by": by})
             for r in rows:
                 res = s.execute(text("update projects set comment = :c, comment_at = case when :c is null then null else current_timestamp end "
                                      "where project_id = :p and user_id = :u and not cancelled"), r)
                 if res.rowcount == 0:
                     s.rollback()
-                    return "Nothing saved: one of the projects is not yours or is cancelled."
+                    return nope
+            for pid, value in dues.items():
+                new = as_date(value)
+                cur = s.execute(text("select start_date, due_date, revised_due, closed_on from projects "
+                                     "where project_id = :p and user_id = :u and not cancelled"), {"p": int(pid), "u": int(user_id)}).first()
+                err = (nope if cur is None else "An updated due date cannot be removed." if new is None
+                       else "A closed project cannot get a new due date." if as_date(cur[3])
+                       else "The updated due date cannot be in the past." if new < today
+                       else "The updated due date must be on or after the start date." if as_date(cur[0]) and new < as_date(cur[0])
+                       else None)
+                if err:
+                    s.rollback()
+                    return err
+                if new != (as_date(cur[2]) or as_date(cur[1])):      # the same date as now is no move
+                    s.execute(text("update projects set revised_due = :d where project_id = :p and user_id = :u"),
+                              {"d": new, "p": int(pid), "u": int(user_id)})
             s.commit()
     except SQLAlchemyError as e:
         return _reason(e)
@@ -259,7 +318,8 @@ def _tiles(s: dict) -> str:
     tiles = [("Open", str(s["open"]), f'{s["soon"]} due within {SOON_DAYS} days' if s["soon"] else "nothing due soon"),
              ("Overdue", str(s["overdue"]), f'max +{s["max_over"]} d' if s["overdue"] else "none"),
              ("Kept", kept, f'{s["kept"]} of {s["settled"]} by the due date' if s["settled"] else "nothing due yet"),
-             ("Closed late", str(s["late"]), "after the due date")]
+             ("Closed late", str(s["late"]), "after the due date"),
+             ("Re-dated", str(s.get("redated", 0)), plural(s.get("redates", 0), "due date move") if s.get("redated") else "due dates kept")]
     return '<div class="kpis">' + "".join(
         f'<div class="kpi"><p class="l">{a}</p><p class="v">{b}</p><p class="d">{c}</p></div>' for a, b, c in tiles) + '</div>'
 
@@ -293,16 +353,21 @@ def _info(r, jira: str) -> str:
         ticket = f'<a href="{esc(jira)}/browse/{esc(k)}" target="_blank">{esc(k)}</a> &middot; {esc(st_)}'
     else:
         ticket = "none"
-    items = [("Start", fmt(r["start_date"])), ("Due", fmt(r["due_date"])), ("Where it stands", state),
-             ("Created", fmt(_local_date(r.get("created_at"))))]
+    items = [("Start", fmt(r["start_date"])), ("Due", fmt(r["due_date"]))]
+    rev, log = r.get("revised_due"), r.get("due_log") or []
+    if is_date(rev):
+        items.append(("Updated due", f'{fmt(rev)} &middot; {plural(len(log), "move")}' if log else fmt(rev)))
+    items += [("Where it stands", state), ("Created", fmt(_local_date(r.get("created_at"))))]
     if is_date(r["closed_on"]):
         items.append(("Closed", fmt(r["closed_on"])))
     items.append(("Ticket", ticket))
     cm, when = r.get("comment"), r.get("comment_at")
     note = (esc(cm) + (f' <span class="l" style="display:inline">&middot; {fmt(_local_date(when))}</span>' if is_date(when) else "")
             if isinstance(cm, str) and cm else '<span class="l" style="display:inline">none</span>')
+    moves = (f'<p class="wide"><span class="l">Due date moves</span>' + " &middot; ".join(
+        f'{fmt(a)} &rarr; {fmt(b)} <span class="l" style="display:inline">on {fmt(w)}</span>' for a, b, w in log) + '</p>') if log else ""
     return ('<div class="ginfo">' + "".join(f'<p><span class="l">{a}</span>{b}</p>' for a, b in items)
-            + f'<p class="wide"><span class="l">Comment</span>{note}</p></div>')
+            + moves + f'<p class="wide"><span class="l">Comment</span>{note}</p></div>')
 
 
 def timeline(c: pd.DataFrame, today: dt.date, jira: str, show_owner: bool = False) -> str:
@@ -310,9 +375,11 @@ def timeline(c: pd.DataFrame, today: dt.date, jira: str, show_owner: bool = Fals
     rows = c[c["outcome"] != "cancelled"]
     if rows.empty:
         return '<p class="sec" style="margin-top:12px">No projects yet.</p>'
-    ends = [d for d in rows["due_date"]] + [d for d in rows["closed_on"] if is_date(d)] + [today]
+    ends = ([d for d in rows["due_date"]] + [d for d in rows["closed_on"] if is_date(d)] + [today]
+            + [d for d, x in zip(rows["revised_due"], rows["closed_on"]) if is_date(d) and not is_date(x)])
     lo = max(min([d for d in rows["start_date"]] + [today]), today - dt.timedelta(days=45))
-    hi = max(ends) + dt.timedelta(days=3)
+    moved = any(is_date(d) and not is_date(x) for d, x in zip(rows["revised_due"], rows["closed_on"]))
+    hi = max(ends) + dt.timedelta(days=8 if moved else 3)       # room for the "+N d" label after a moved date
     if (hi - lo).days < 14:
         hi = lo + dt.timedelta(days=14)
     span = (hi - lo).days
@@ -327,6 +394,7 @@ def timeline(c: pd.DataFrame, today: dt.date, jira: str, show_owner: bool = Fals
             ticks.append(d)
     h = ['<div class="axis" style="margin-left:240px">' + "".join(
         f'<span style="left:{pct(d)}%">{esc(d.strftime("%d %b").lstrip("0"))}</span>' for d in sorted(ticks)) + '</div>']
+    drew_rev = False
     for _, r in order.iterrows():
         o, n = r["outcome"], r["days"]
         start, due = r["start_date"], r["due_date"]
@@ -342,16 +410,26 @@ def timeline(c: pd.DataFrame, today: dt.date, jira: str, show_owner: bool = Fals
             lbl = "kept" if o == "kept" else f"late {int(n)} d"
             h.append(f'<span class="glbl" style="left:{min(pct(end) + 1, 88)}%">{lbl}</span>')
         else:
+            rev = r["revised_due"] if is_date(r["revised_due"]) else None
             h.append(f'<div class="gbar g-open" style="left:{pct(start)}%;width:{max(pct(due) - pct(start), 0.8)}%"></div>')
             if o == "overdue":
                 h.append(f'<div class="gbar g-over" style="left:{pct(due)}%;width:{max(pct(today) - pct(due), 0.8)}%"></div>')
-                h.append(f'<span class="glbl r" style="left:{min(pct(today) + 1, 90)}%">+{int(n)} d</span>')
+            if rev and rev != due:                  # drawn after the red tail so it stays visible; thinner over it
+                a, b = sorted((due, rev))
+                h.append(f'<div class="gbar g-rev{" thin" if o == "overdue" else ""}" style="left:{pct(a)}%;width:{max(pct(b) - pct(a), 0.8)}%" '
+                         f'title="due date moved to {fmt(rev)}"></div>')
+                drew_rev = True
+            end = max(today, rev) if rev else today
+            if o == "overdue":
+                h.append(f'<span class="glbl r" style="left:{min(pct(end) + 1, 90)}%">+{int(n)} d</span>')
             else:
-                h.append(f'<span class="glbl" style="left:{min(pct(due) + 1, 86)}%">{fmt(due)}</span>')
+                h.append(f'<span class="glbl" style="left:{min(pct(max(due, rev) if rev else due) + 1, 86)}%">{fmt(rev or due)}</span>')
         h.append('</div></summary>' + _info(r, jira) + '</details>')
     h.append('<div class="end"></div><div class="legend"><span><span class="sw g-open"></span>open</span>'
              '<span><span class="sw g-over"></span>past due</span><span><span class="sw g-kept"></span>kept</span>'
-             '<span><span class="sw g-late"></span>closed late</span></div>')
+             '<span><span class="sw g-late"></span>closed late</span>'
+             + ('<span><span class="sw g-rev"></span>due date moved</span>' if drew_rev else "")
+             + '</div>')
     return "".join(h)
 
 
@@ -384,6 +462,7 @@ def team_view(c: pd.DataFrame, people: list[tuple[str, str]], today: dt.date, ji
     for i, n, ini, mine in per:
         s = stats(mine, today)
         kind, label = verdict(s["kept"], s["settled"])
+        moved = f'<br><small>{s["redated"]} re-dated</small>' if s.get("redated") else ""
         h.append('<div class="crow">' + _who(i, n, ini, tag(n)) + _chip(kind, label) + '</div></div>')
         if s["settled"]:
             sq = []
@@ -393,9 +472,9 @@ def team_view(c: pd.DataFrame, people: list[tuple[str, str]], today: dt.date, ji
                         f' · +{int(r["days"])} d' if oc == "overdue" else (f' · late {int(r["days"])} d' if oc == "late" else ""))
                     sq.append(f'<i class="{cls}" title="{esc(tip)}"></i>')
             h.append(f'<div class="sq{" sm" if small else ""}">{"".join(sq)}</div>')
-            h.append(f'<div class="kc"><b>{s["kept"]}</b> of {s["settled"]} kept</div>')
+            h.append(f'<div class="kc"><b>{s["kept"]}</b> of {s["settled"]} kept{moved}</div>')
         else:
-            h.append('<span class="nil">nothing due yet</span><div class="kc"><b class="dim">&mdash;</b></div>')
+            h.append(f'<span class="nil">nothing due yet</span><div class="kc"><b class="dim">&mdash;</b>{moved}</div>')
         h.append('</div>')
     h.append('<div class="end"></div><div class="legend"><span><span class="sw s-kept"></span>kept</span>'
              '<span><span class="sw s-late"></span>closed late</span><span><span class="sw s-past"></span>open past due</span></div></div>')
@@ -453,7 +532,9 @@ def team_view(c: pd.DataFrame, people: list[tuple[str, str]], today: dt.date, ji
             cm = r.get("comment")
             note = f'<div class="cml">{esc(cm)}</div>' if isinstance(cm, str) and cm else ""
             h.append(f'<tr><td>{esc(r["title"])}{_ticket_chip(r, jira)}{note}</td><td>{esc(r["owner"])}</td>'
-                     f'<td class="num">{fmt(r["due_date"])}</td><td class="r num" style="color:#a32d2d">+{r["_d"]} d</td></tr>')
+                     f'<td class="num">{fmt(r["due_date"])}'
+                     + (f'<div class="cml">&rarr; {fmt(r["revised_due"])}</div>' if is_date(r["revised_due"]) else "")
+                     + f'</td><td class="r num" style="color:#a32d2d">+{r["_d"]} d</td></tr>')
         h.append('</tbody></table></div>')
     h.append('</div>')
     return "".join(h)
@@ -462,7 +543,7 @@ def team_view(c: pd.DataFrame, people: list[tuple[str, str]], today: dt.date, ji
 def excel(c: pd.DataFrame) -> bytes:
     """One sheet with every project, its outcome and comment, plus one sheet per person."""
     cols = {"owner": "Person", "title": "Project", "created": "Created", "start_date": "Start", "due_date": "Due",
-            "closed_on": "Closed", "outcome": "Outcome", "days": "Days past due (+) / to due", "jira_key": "Ticket",
+            "revised_due": "Updated due", "redates": "Due date moves", "closed_on": "Closed", "outcome": "Outcome", "days": "Days past due (+) / to due", "jira_key": "Ticket",
             "comment": "Comment"}
     df = c[c["outcome"] != "cancelled"].copy()
     df["created"] = [_local_date(t) for t in df["created_at"]]          # the day in Rome, as on the screens
@@ -480,7 +561,7 @@ def excel(c: pd.DataFrame) -> bytes:
             used.add(name.lower())
             part.to_excel(xw, sheet_name=name, index=False)
         for ws in xw.sheets.values():
-            for col, w in zip("ABCDEFGHIJ", [22, 60, 12, 12, 12, 12, 10, 12, 16, 60]):
+            for col, w in zip("ABCDEFGHIJKL", [22, 60, 12, 12, 12, 12, 10, 12, 10, 12, 16, 60]):
                 ws.column_dimensions[col].width = w
             ws.freeze_panes = "A2"
             for row in ws.iter_rows(min_row=2):      # a title or comment starting with "=" is text, not a formula

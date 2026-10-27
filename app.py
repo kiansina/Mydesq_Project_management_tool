@@ -599,6 +599,7 @@ def apply_changes(spec: dict, original: pd.DataFrame, state: dict, lookups: dict
         with conn().session as s:
             if table == "projects" and conn().engine.dialect.name == "postgresql":
                 s.execute(text("select set_config('app.admin', 'on', true)"))   # the admin may change any project
+                s.execute(text("select set_config('app.user', :u, true)"), {"u": ACCOUNT["user"]})   # who moved a due date
             for sql, params in ops:
                 s.execute(text(sql), params)
             s.commit()
@@ -1361,6 +1362,7 @@ try:
 except Exception:  # noqa: BLE001 - before supabase_projects.sql
     projects = None
 HAS_COMMENT = projects is not None and "comment_at" in projects.columns
+HAS_REDATE = projects is not None and "revised_due" in DL.columns(query)      # supabase_project_redate.sql has run
 ACH = AC.load(query)                                   # None until supabase_achievements.sql has run
 # the signed-in person's row in the users table (anyone can keep their own projects)
 USER_ID = next((int(u) for u, n in zip(team["user_id"], names) if ACCOUNT["name"] and n.lower() == ACCOUNT["name"].lower()), None)
@@ -1450,8 +1452,8 @@ def project_actions(mine: pd.DataFrame) -> None:
 
 
 def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
-    """Open projects with dates, ticket and comment. On your own projects the Comment column is editable (one comment
-    per project); everyone else sees the same table read-only."""
+    """Open projects with dates, ticket and comment. On your own projects the Updated due and Comment columns are
+    editable; the original Due never changes and every move of the updated date is logged. Others read the same table."""
     msg = st.session_state.pop("_cm_msg", None)
     if msg:
         st.success(msg)
@@ -1460,35 +1462,44 @@ def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
     if op.empty:
         return
     view = pd.DataFrame({"project_id": op["project_id"].astype(int).tolist(), "Project": op["title"].tolist(),
-                         "Start": op["start_date"].tolist(), "Due": op["due_date"].tolist(),
-                         "Ticket": [f"{JIRA}/browse/{k}" if isinstance(k, str) and k else "" for k in op["jira_key"]]})
+                         "Start": op["start_date"].tolist(), "Due": op["due_date"].tolist()})
+    if HAS_REDATE:
+        view["Updated due"] = [d if DL.is_date(d) else None for d in op["revised_due"]]
+        view["Moves"] = [int(x) for x in op["redates"]]
+    view["Ticket"] = [f"{JIRA}/browse/{k}" if isinstance(k, str) and k else "" for k in op["jira_key"]]
     if HAS_COMMENT:
         view["Comment"] = [c if isinstance(c, str) else "" for c in op["comment"]]
     config = {"Project": st.column_config.TextColumn("Project", width="medium"),
               "Start": st.column_config.DateColumn("Start", format="DD/MM/YYYY"),
-              "Due": st.column_config.DateColumn("Due", format="DD/MM/YYYY"),
+              "Due": st.column_config.DateColumn("Due", format="DD/MM/YYYY", help="The committed due date: it never changes"),
+              "Updated due": st.column_config.DateColumn("Updated due", format="DD/MM/YYYY", min_value=today,
+                                                         help="A new due date; every move is logged and counts against keeping commitments"),
+              "Moves": st.column_config.NumberColumn("Moves", format="%d", help="How many times the due date was moved"),
               "Ticket": st.column_config.LinkColumn("Ticket", display_text=r".*/browse/(.*)"),
               "Comment": st.column_config.TextColumn("Comment", width="large", max_chars=DL.COMMENT_MAX)}
-    if not (own and HAS_COMMENT and USER_ID is not None):
+    editable = [c for c in ("Updated due", "Comment") if c in view.columns]
+    if not (own and editable and USER_ID is not None):
         st.dataframe(view.drop(columns="project_id"), hide_index=True, width="stretch", key=f"{key}_open", column_config=config)
         return
-    # the key follows the projects and the saved comments: an unsaved edit never lands on another project, and after a
-    # save (or a change by the admin) the table starts afresh from what is stored
-    ek = f"{key}_cm_{hashlib.sha256(repr((tuple(view['project_id']), tuple(view['Comment']))).encode()).hexdigest()[:8]}"
+    # the key follows the projects and what is stored: an unsaved edit never lands on another project, and after a save
+    # (or a change by the admin) the table starts afresh
+    ek = f"{key}_cm_{hashlib.sha256(repr([tuple(view[c]) for c in ['project_id'] + editable]).encode()).hexdigest()[:8]}"
     edited = st.data_editor(view, key=ek, hide_index=True, width="stretch", num_rows="fixed", column_config=config,
-                            column_order=["Project", "Start", "Due", "Ticket", "Comment"],
-                            disabled=["project_id", "Project", "Start", "Due", "Ticket"])
-    changes = {int(pid): c for pid, c, was in zip(edited["project_id"], edited["Comment"], view["Comment"])
-               if DL.clean_comment(c) != DL.clean_comment(was)}
-    if st.button(f"Save {plural(len(changes), 'comment')}" if changes else "Save", type="primary",
-                 disabled=not changes, key=ek + "_save"):
-        err = DL.set_comments(conn(), USER_ID, changes)
+                            column_order=[c for c in view.columns if c != "project_id"],
+                            disabled=[c for c in view.columns if c not in editable])
+    comments = ({int(pid): c for pid, c, was in zip(edited["project_id"], edited["Comment"], view["Comment"])
+                 if DL.clean_comment(c) != DL.clean_comment(was)} if HAS_COMMENT else {})
+    dues = ({int(pid): d for pid, d, was in zip(edited["project_id"], edited["Updated due"], view["Updated due"])
+             if DL.as_date(d) != DL.as_date(was)} if HAS_REDATE else {})
+    n = len(comments) + len(dues)
+    if st.button(f"Save {plural(n, 'change')}" if n else "Save", type="primary", disabled=not n, key=ek + "_save"):
+        err = DL.save_open(conn(), USER_ID, comments, dues, today, ACCOUNT["user"])
         if err:
             st.error(err)
             return
         st.cache_data.clear()
         del st.session_state[ek]
-        st.session_state["_cm_msg"] = "Comments saved."
+        st.session_state["_cm_msg"] = "Saved."
         st.rerun()
 
 
@@ -1657,11 +1668,11 @@ def manage_tables() -> None:
     else:
         df = query(f"""
             select p.project_id, u.full_name as owner, p.title, p.start_date, p.due_date, p.closed_on,
-                   p.jira_key, {"p.comment," if HAS_COMMENT else ""} p.cancelled, p.created_at
+                   p.jira_key, {"p.comment," if HAS_COMMENT else ""} {"p.revised_due," if HAS_REDATE else ""} p.cancelled, p.created_at
             from projects p join users u on u.user_id = p.user_id
             order by p.project_id
         """)
-        for c in ["start_date", "due_date", "closed_on"]:
+        for c in ["start_date", "due_date", "closed_on"] + (["revised_due"] if HAS_REDATE else []):
             df[c] = to_dates(df[c])
         df["cancelled"] = [bool(x) for x in df["cancelled"]]
         df["owner"] = df["owner"].astype(str).str.strip()
@@ -1685,7 +1696,8 @@ def manage_tables() -> None:
             "table": "projects", "pk": "project_id",
             "required": ["user_id", "title", "start_date", "due_date"],
             "kinds": {"project_id": "int", "owner": "text", "title": "text", "start_date": "date", "due_date": "date",
-                      "closed_on": "date", "jira_key": "text", "cancelled": "bool", **({"comment": "text"} if HAS_COMMENT else {})},
+                      "closed_on": "date", "jira_key": "text", "cancelled": "bool", **({"comment": "text"} if HAS_COMMENT else {}),
+                      **({"revised_due": "date"} if HAS_REDATE else {})},
             "to_db": {"owner": ("user_id", "users")},
             "disabled": ["project_id", "created_at"],
             "config": {
@@ -1694,6 +1706,8 @@ def manage_tables() -> None:
                 "title": st.column_config.TextColumn("Project", width="large", required=True, max_chars=200),
                 "start_date": st.column_config.DateColumn("Start", format="DD/MM/YYYY", default=today, required=True),
                 "due_date": st.column_config.DateColumn("Due", format="DD/MM/YYYY", required=True),
+                "revised_due": st.column_config.DateColumn("Updated due", format="DD/MM/YYYY",
+                                                           help="Every change is logged; the original Due stays the commitment"),
                 "closed_on": st.column_config.DateColumn("Closed", format="DD/MM/YYYY"),
                 "jira_key": st.column_config.TextColumn("Ticket", help="Like MYDSUP-15908"),
                 "comment": st.column_config.TextColumn("Comment", width="large", max_chars=DL.COMMENT_MAX),
@@ -1805,6 +1819,8 @@ def dashboard_section() -> None:
         h.append(tile("Projects open", ps["open"], f'{ps["overdue"]} overdue' if ps["overdue"] else "none overdue"))
         h.append(tile("Projects kept", f'{ps["kept_pct"]}%' if ps["kept_pct"] is not None else "&mdash;",
                       f'{ps["kept"]} of {ps["settled"]} by the due date' if ps["settled"] else "nothing due yet"))
+        if HAS_REDATE:
+            h.append(tile("Projects re-dated", ps["redated"], plural(ps["redates"], "due date move") if ps["redated"] else "due dates kept"))
     h.append('</div></div>')
     st.markdown(CSS + h[0] + "".join(h[1:]), unsafe_allow_html=True)
     if not acc:

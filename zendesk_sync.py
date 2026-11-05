@@ -42,6 +42,8 @@ ZD_OFFSET = 1_000_000                                  # ticket_id of a Zendesk-
 SKIP_ON_MIGRATED = {"api", "sla"}                      # audits by the migration and SLA bookkeeping: not work by anyone
 MERGED = "Declined"                                    # a ticket closed by a merge counts as a duplicate
 LIGHT_FIELD = 52109853899153                           # custom field "Light Agent Assignee": the ticket's real owner
+MOVED = "Moved to Zendesk"                             # a Jira ticket left open in Jira whose work goes on in Zendesk
+GONE = ("Deleted in Zendesk", MOVED, "Not in Jira scope")   # rows left out of every count and figure
 JIRA_KEY = re.compile(r"^MYDSUP-(\d+)$")
 PRIORITY = {"urgent": "Critical", "high": "High", "normal": "Medium", "low": "Low"}
 OPEN = {"new", "open", "pending", "hold"}              # Zendesk status categories still in work
@@ -488,8 +490,15 @@ def run_sync(engine: sa.Engine, zd: Zendesk, mode: str = "incremental", log=prin
             for name in ("jira_events", "jira_comments"):
                 t = store.t[name]
                 c.execute(sa.delete(t).where(t.c.ticket_id.in_(tids), t.c.source == "zendesk"))
-            c.execute(sa.update(tk).where(tk.c.ticket_id.in_(tids)).values(state="Closed", jira_status="Deleted in Zendesk"))
+            c.execute(sa.update(tk).where(tk.c.ticket_id.in_(tids)).values(state="Closed", jira_status=GONE[0]))
         log(f"{len(gone)} tickets deleted in Zendesk were marked closed")
+    # every Jira ticket was moved to Zendesk: one still open here without a Zendesk ticket was re-created there under a
+    # new number (or dropped), so it is closed here as moved, not as resolved by anyone
+    with engine.begin() as c:
+        moved = c.execute(sa.update(tk).where(tk.c.zendesk_id.is_(None), tk.c.state == "Open", tk.c.jira_key.like("MYDSUP-%"))
+                          .values(state="Closed", jira_status=MOVED)).rowcount
+    if moved:
+        log(f"{moved} Jira tickets still open without a Zendesk ticket were closed as moved to Zendesk")
     summary = {"mode": mode, "source": "zendesk", "tickets": done, "listed": len(listed), "started": started.isoformat(),
                "seconds": round((dt.datetime.now(UTC) - started).total_seconds(), 1)}
     with engine.begin() as c:

@@ -145,7 +145,26 @@ a date (not in the future) and an optional comment. Documents and screenshots st
 asks for them when needed. A person adds, edits and deletes their own (the admin anyone's); managers read them. The
 list follows the Dashboard's period.
 
-## 7. Jira sync and Ticket health
+## 7. Zendesk sync (since November 2026)
+
+The team moved from Jira to Zendesk (`mydesqsupport`). The Jira history (about 15,000 tickets) stays in Supabase as it
+is; `zendesk_sync.py` adds what happens in Zendesk. **Read-only**: it signs in with an OAuth client (client
+credentials, scope `read`) and only reads.
+
+* A migrated ticket (Zendesk `external_id` = its Jira key) updates its existing row; only what happens in Zendesk after
+  the go-live (2 November 2026) is added to its history. The migration's own steps are skipped.
+* A new ticket gets the key `ZD-<Zendesk number>`. Ticket links open Zendesk, and tables show the Zendesk number (#145).
+* Open = not solved or closed and not delivered (Client Feedback counts as delivered), as in Jira.
+* People are linked to their Zendesk agent (`users.zendesk_user_id`) and keep the account their Jira history uses, so
+  their figures continue. When linking a project, type the Zendesk number.
+* Zendesk SLA timers are not read yet: "answered in time" covers the Jira tickets.
+
+Setup, once: run `supabase_zendesk.sql` in Supabase (it lists who is linked: all 23 people), add the
+`[zendesk]` block from `secrets.toml.example` to the Streamlit secrets, upload the files, then Manage > **Zendesk sync**
+> **Full re-sync** (about a minute). Zendesk no longer issues API tokens; the OAuth client is created by a Zendesk admin
+in Admin Center > Apps and integrations > APIs > OAuth clients (kind: confidential).
+
+## 8. Jira sync (stopped November 2026) and Ticket health
 
 Every MYDSUP ticket is copied from Jira into Supabase: tickets updated since the start of the
 previous year with their history, older ones as rows only. People linked to a Jira account

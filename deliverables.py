@@ -85,6 +85,38 @@ def person_color(i: int) -> tuple[str, str, str]:
     return PERSON_COLORS[i % len(PERSON_COLORS)]
 
 
+ZENDESK = ""      # https://<subdomain>.zendesk.com, set by the app: a ticket with a Zendesk number opens there
+
+
+def ticket_url(jira: str, key, zid=None) -> str:
+    """Where a ticket opens: Zendesk when it has a Zendesk number, else its old Jira address."""
+    if ZENDESK and zid is not None and not pd.isna(zid):
+        return f"{ZENDESK}/agent/tickets/{int(zid)}"
+    m = re.fullmatch(r"ZD-(\d+)", str(key))
+    if ZENDESK and m:                                   # a Zendesk ticket not synced yet
+        return f"{ZENDESK}/agent/tickets/{m.group(1)}"
+    return f"{jira}/browse/{key}"
+
+
+def ticket_label(key, zid=None) -> str:
+    """How a ticket is named on screen: its Zendesk number (#145) when it has one, else its key."""
+    return f"#{int(zid)}" if zid is not None and not pd.isna(zid) else str(key)
+
+
+def resolve_key(conn, raw) -> str | None:
+    """A ticket typed by a person: a Zendesk number (316 or #316), or a key (ZD-316, MYDSUP-15908). A Zendesk number
+    finds the ticket's key (a migrated ticket keeps its MYDSUP key); an unknown number becomes ZD-<number>."""
+    s = re.sub(r"(?i)^zd-", "", (raw or "").strip().lstrip("#").strip())
+    if s.isascii() and s.isdigit():
+        try:
+            with conn.session as ss:
+                k = ss.execute(text("select jira_key from tickets where zendesk_id = :z"), {"z": int(s)}).scalar()
+        except SQLAlchemyError:                         # before supabase_zendesk.sql
+            return normal_key(s)
+        return k or f"ZD-{int(s)}"
+    return normal_key(s)
+
+
 def normal_key(key: str, prefix: str = "MYDSUP-") -> str | None:
     """'15908', 'mydsup-15908' or 'MYDSUP-15908' -> 'MYDSUP-15908'; None when it is not a ticket key."""
     k = (key or "").strip().upper()
@@ -99,15 +131,19 @@ def load(query) -> pd.DataFrame:
     a frame. Before supabase_project_comment.sql there is no comment_at column and every comment is empty."""
     sql = """
         select p.project_id, p.user_id, u.full_name as owner, p.title, p.created_at, p.start_date, p.due_date,
-               p.closed_on, p.jira_key, p.cancelled, {extra} t.jira_status as ticket_status, t.state as ticket_state
+               p.closed_on, p.jira_key, p.cancelled, {extra} t.jira_status as ticket_status, t.state as ticket_state{zid}
         from projects p
         join users u on u.user_id = p.user_id
         left join tickets t on t.jira_key = p.jira_key
         order by p.due_date, p.project_id
     """
     cols = columns(query)
+    zid = "zendesk_id" in set(query("select * from tickets where 1 = 0").columns)
     df = query(sql.format(extra=("p.comment, p.comment_at, " if {"comment", "comment_at"} <= cols else "")
-                               + ("p.revised_due, " if "revised_due" in cols else "")))
+                               + ("p.revised_due, " if "revised_due" in cols else ""),
+                          zid=", t.zendesk_id" if zid else ""))
+    if "zendesk_id" not in df.columns:      # before supabase_zendesk.sql
+        df["zendesk_id"] = None
     if "comment_at" in df.columns:
         df["comment_at"] = pd.to_datetime(df["comment_at"], errors="coerce", utc=True).dt.tz_convert(ROME)
     else:                                   # before supabase_project_comment.sql
@@ -291,11 +327,12 @@ def add(conn, user_id: int, title: str, start: dt.date, due: dt.date, jira_key: 
         return "Due date cannot be in the past."
     if due < start:
         return "The due date must be on or after the start date."
-    if jira_key and not normal_key(jira_key):
-        return "Ticket key looks wrong (example: MYDSUP-15908)."
+    k = resolve_key(conn, jira_key) if jira_key else None
+    if jira_key and not k:
+        return "Ticket looks wrong: type the Zendesk number (316) or a key (MYDSUP-15908)."
     return _run(conn, "insert into projects (user_id, title, start_date, due_date, jira_key, created_by) "
                       "values (:u, :t, :s, :d, :k, :by)",
-                {"u": int(user_id), "t": title, "s": start, "d": due, "k": normal_key(jira_key) if jira_key else None, "by": created_by})
+                {"u": int(user_id), "t": title, "s": start, "d": due, "k": k, "by": created_by})
 
 
 def close(conn, project_id: int, user_id: int, closed_by: str, today: dt.date) -> str | None:
@@ -305,9 +342,9 @@ def close(conn, project_id: int, user_id: int, closed_by: str, today: dt.date) -
 
 
 def link(conn, project_id: int, user_id: int, jira_key: str) -> str | None:
-    k = normal_key(jira_key)
+    k = resolve_key(conn, jira_key)
     if not k:
-        return "Ticket key looks wrong (example: MYDSUP-15908)."
+        return "Ticket looks wrong: type the Zendesk number (316) or a key (MYDSUP-15908)."
     return _run(conn, "update projects set jira_key = :k where project_id = :p and user_id = :u and jira_key is null and not cancelled",
                 {"k": k, "p": int(project_id), "u": int(user_id)})
 
@@ -329,7 +366,8 @@ def _ticket_chip(r, jira: str) -> str:
     if not isinstance(k, str) or not k:
         return ""
     st_ = r.get("ticket_status") if isinstance(r.get("ticket_status"), str) and r.get("ticket_status") else "not synced"
-    return f'<a class="kchip" href="{esc(jira)}/browse/{esc(k)}" target="_blank" title="{esc(st_)}">{esc(k)} &middot; {esc(st_)}</a>'
+    url, label = ticket_url(jira, k, r.get("zendesk_id")), ticket_label(k, r.get("zendesk_id"))
+    return f'<a class="kchip" href="{esc(url)}" target="_blank" title="{esc(k)} &middot; {esc(st_)}">{esc(label)} &middot; {esc(st_)}</a>'
 
 
 CM_ICON = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round">'
@@ -350,7 +388,8 @@ def _info(r, jira: str) -> str:
     k = r.get("jira_key")
     if isinstance(k, str) and k:
         st_ = r.get("ticket_status") if isinstance(r.get("ticket_status"), str) and r.get("ticket_status") else "not synced"
-        ticket = f'<a href="{esc(jira)}/browse/{esc(k)}" target="_blank">{esc(k)}</a> &middot; {esc(st_)}'
+        ticket = (f'<a href="{esc(ticket_url(jira, k, r.get("zendesk_id")))}" target="_blank">{esc(ticket_label(k, r.get("zendesk_id")))}</a>'
+                  f' &middot; {esc(st_)}')
     else:
         ticket = "none"
     items = [("Start", fmt(r["start_date"])), ("Due", fmt(r["due_date"]))]

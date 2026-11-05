@@ -48,6 +48,8 @@ ZENDESK = f"https://{ZD_SUB}.zendesk.com" if ZD_SUB else ""
 DL.ZENDESK = ZENDESK                                          # tickets with a Zendesk number open there
 # where new data comes from: Zendesk since November 2026 (the Jira sync is stopped for good)
 SOURCE = "Zendesk" if secret("zendesk", "client_id", "") else ""
+# tickets that left the system (deleted in Zendesk, moved there under a new number): out of every count and figure
+GONE_SQL = "('Deleted in Zendesk', 'Moved to Zendesk', 'Not in Jira scope')"
 SNAPSHOT = pd.to_datetime(secret("app", "snapshot_date", dt.date.today())).date()
 # Per-person ticket figures (Ticket health people cards, nudge avatars). On unless [app] ticket_people_view = false.
 
@@ -805,7 +807,7 @@ def flow_model(sync_key: str) -> dict | None:
     """Who received, resolved and holds which ticket (ticket_flow.py); rebuilt once per sync."""
     try:
         t = query("select ticket_id, created_at, resolved_at, resolution, assignee_account, closed_assignee_account "
-                  "from tickets where jira_key is not null and coalesce(jira_status, '') <> 'Deleted in Zendesk'")
+                  f"from tickets where jira_key is not null and coalesce(jira_status, '') not in {GONE_SQL}")
         e = query("select ticket_id, at, history_id, item_no, field, from_account, to_account from jira_events where field = 'assignee'")
     except Exception:  # noqa: BLE001 - before supabase_ticket_people.sql
         return None
@@ -818,7 +820,7 @@ def health_model(sync_key: str) -> dict | None:
     """Rebuilt once per sync (sync_key changes when new data arrives). Returns None before the Jira tables exist."""
     # The sync stores every MYDSUP ticket; Ticket health looks at the tickets people linked to Jira handle
     # (assigned to one of them now, or ever handed to or from one of them), plus every open ticket.
-    scope = """select t.ticket_id from tickets t where t.jira_key is not null and coalesce(t.jira_status, '') <> 'Deleted in Zendesk'
+    scope = f"""select t.ticket_id from tickets t where t.jira_key is not null and coalesce(t.jira_status, '') not in {GONE_SQL}
                    and (t.assignee_id is not null or t.resolution is null
                    or t.jira_status in (select status from jira_status_map where not delivered) or exists (
                    select 1 from jira_events e where e.ticket_id = t.ticket_id and e.field = 'assignee'

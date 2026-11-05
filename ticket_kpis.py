@@ -33,6 +33,8 @@ PERSON_BAR_MIN = 5
 NUDGE_OURS_BD = {"Critical": 0.5, "High": 1.0, "Medium": 3.0, "Low": 3.0}
 NUDGE_TRIAGE_BD, NUDGE_CLIENT_BD, NUDGE_BANK_BD, NUDGE_RELEASE_BD = 1.0, 5.0, 5.0, 15.0
 DEFAULT_DELIVERED = {"Client Feedback", "Closed", "Declined"}
+CLOSED = {"Closed", "Closed \u2013 Delivered"}          # final: Jira's Closed, Zendesk's Closed – Delivered
+NOT_DONE = {"Declined", "Canceled"}                    # final without delivering anything (Jira, Zendesk)
 SIDES = ["team", "triage", "other_team", "client", "external", "release"]
 SIDE_LABEL = {"team": "Our side", "triage": "Triage", "other_team": "Another team", "client": "Client",
               "external": "Bank", "release": "Release", "unmapped": "Unmapped"}
@@ -233,7 +235,7 @@ def build(tickets: pd.DataFrame, events: pd.DataFrame, comments: pd.DataFrame, s
             open=status_now not in delivered, side_now=side_of(status_now, holder_now, side_map),
             status_since=st_rows[-1].at if st_rows else created, arrival=arrival, first_assignee=first_assignee,
             last_team_touch=max(touches) if touches else None, last_team_public=last_pub.get(tid), team_passes=team_passes,
-            returned_recently=False, reached_closed=any(r.to_value == "Closed" for r in st_rows), segments=segs)
+            returned_recently=False, reached_closed=any(r.to_value in CLOSED for r in st_rows), segments=segs)
 
         # B4 first delivery, B5 returns
         fd_i = next((i for i, r in enumerate(st_rows) if r.to_value in delivered and r.from_value not in delivered), None)
@@ -256,11 +258,11 @@ def build(tickets: pd.DataFrame, events: pd.DataFrame, comments: pd.DataFrame, s
             tk.deliverer = d_holder if isinstance(d_holder, int) else None
             limit = fd.at + dt.timedelta(days=RETURN_WINDOW_DAYS)
             cb = [at for i, at in quals if i > fd_i and at <= limit]   # event order, not timestamps
-            if fd.to_value == "Declined":
+            if fd.to_value in NOT_DONE:
                 tk.outcome = "declined"
             elif cb:
                 tk.outcome, tk.came_back_at = "came_back", cb[0]
-            elif now >= limit or fd.to_value == "Closed" or any(r.to_value == "Closed" for r in st_rows[fd_i + 1:]):
+            elif now >= limit or fd.to_value in CLOSED or any(r.to_value in CLOSED for r in st_rows[fd_i + 1:]):
                 tk.outcome = "held"
             else:
                 tk.outcome = "waiting"

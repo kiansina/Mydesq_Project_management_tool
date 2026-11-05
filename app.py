@@ -11,6 +11,7 @@ Configuration lives in .streamlit/secrets.toml (see secrets.toml.example):
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
 from pathlib import Path
 import hashlib
@@ -1819,6 +1820,23 @@ def achievements_part(person: str, months: list, label: str, own: bool) -> None:
         _ach_done(AC.save(conn(), uid, edits, deletes, today), "Achievements saved.")
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def photos() -> dict[int, str]:
+    """user_id -> the person's photo as an inline image (supabase_photos.sql); empty before that has run."""
+    try:
+        df = query("select user_id, mime, encode(image, 'base64') as b64 from user_photos")
+    except Exception:  # noqa: BLE001 - no table yet, or SQLite (tests): the raw image instead
+        try:
+            df = query("select user_id, mime, image as b64 from user_photos")
+        except Exception:  # noqa: BLE001
+            return {}
+    out = {}
+    for uid, mime, b in zip(df["user_id"], df["mime"], df["b64"]):
+        b = "".join(b.split()) if isinstance(b, str) else base64.b64encode(bytes(b)).decode()
+        out[int(uid)] = f"data:{mime or 'image/jpeg'};base64,{b}"
+    return out
+
+
 def dashboard_section() -> None:
     """One person's page: their tickets for a period, their projects, their open tickets.
     A user sees their own; managers and the admin choose anyone (view only)."""
@@ -1850,7 +1868,10 @@ def dashboard_section() -> None:
     def tile(lbl, val, sub):
         return f'<div class="kpi"><p class="l">{lbl}</p><p class="v">{val}</p><p class="d">{sub}</p></div>'
 
-    h = [f'<div class="dm"><div class="top"><span class="h1">{esc(person)} <span class="tm">{esc(TEAM_OF.get(person, ""))}</span></span><span class="muted">{esc(label)}</span></div><div class="kpis">']
+    pic = photos().get(USER_OF.get(person))
+    face = (f'<img src="{pic}" alt="" style="width:44px;height:44px;border-radius:50%;object-fit:cover;'
+            f'vertical-align:middle;margin-right:10px">' if pic else "")
+    h = [f'<div class="dm"><div class="top"><span class="h1">{face}{esc(person)} <span class="tm">{esc(TEAM_OF.get(person, ""))}</span></span><span class="muted">{esc(label)}</span></div><div class="kpis">']
     if row is not None:
         h.append(tile("Assigned", int(row["assigned"]), f'{int(row["handed_on"])} handed on'))
         h.append(tile("Resolved", int(row["resolved"]), f'{int(row["resolved_pct"])}% of assigned' if pd.notna(row["resolved_pct"]) else "&nbsp;"))

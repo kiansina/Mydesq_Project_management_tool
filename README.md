@@ -155,6 +155,8 @@ credentials, scope `read`) and only reads.
   the go-live (2 November 2026) is added to its history. The migration's own steps are skipped.
 * A new ticket gets the key `ZD-<Zendesk number>`. Ticket links open Zendesk, and tables show the Zendesk number (#145).
 * Open = not solved or closed and not delivered (Client Feedback counts as delivered), as in Jira.
+* Every Jira ticket moved to Zendesk: one still open here without a Zendesk ticket (re-created there under a new
+  number) is closed as "Moved to Zendesk" and left out of the counts, like tickets deleted in Zendesk.
 * Light agents: when the Zendesk field **Light Agent Assignee** is set, the ticket is that light agent's (their
   dashboard, counts and KPIs), not the full agent's who stands in as assignee. A change of that field is a hand-over.
 * People are linked to their Zendesk agent (`users.zendesk_user_id`) and keep the account their Jira history uses, so

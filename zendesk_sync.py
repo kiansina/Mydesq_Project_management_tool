@@ -6,6 +6,8 @@ stays in the database as it is; this sync adds what happens in Zendesk:
   in Zendesk is added next to its Jira history (source = 'zendesk'). The migration's own steps (made through the API,
   and SLA bookkeeping) are skipped: they are not work anybody did.
 - a new ticket gets a row of its own: key ZD-<Zendesk number>, ticket_id = 1,000,000 + Zendesk number.
+- light agents cannot be a Zendesk assignee, so a full agent stands in as assignee and the "Light Agent Assignee"
+  field names the light agent: when that field is set, the ticket is the light agent's (now and in its history).
 - statuses keep the Jira meaning: "open" = not solved or closed and not delivered (Client Feedback counts as delivered).
   A ticket closed by merging into another counts as Declined, like Jira's duplicates.
 
@@ -39,6 +41,7 @@ LOCAL_TZ = ZoneInfo("Europe/Rome")
 ZD_OFFSET = 1_000_000                                  # ticket_id of a Zendesk-only ticket: clear of every Jira number
 SKIP_ON_MIGRATED = {"api", "sla"}                      # audits by the migration and SLA bookkeeping: not work by anyone
 MERGED = "Declined"                                    # a ticket closed by a merge counts as a duplicate
+LIGHT_FIELD = 52109853899153                           # custom field "Light Agent Assignee": the ticket's real owner
 JIRA_KEY = re.compile(r"^MYDSUP-(\d+)$")
 PRIORITY = {"urgent": "Critical", "high": "High", "normal": "Medium", "low": "Low"}
 OPEN = {"new", "open", "pending", "hold"}              # Zendesk status categories still in work
@@ -158,6 +161,38 @@ class ZPeople:
         for zid, name in self.agents.items():
             self.account[zid] = linked.get(zid) or by_name.get(" ".join(str(name).lower().split())) or f"zd:{zid}"
         self.staff_names: dict[str, str] = {}
+        self._by_name = {" ".join(str(n).lower().split()): z for z, n in self.agents.items()}
+        self.light: dict[str, int] = {}               # option value of the Light Agent Assignee field -> agent id
+
+    def agent_named(self, name) -> int | None:
+        return self._by_name.get(" ".join(str(name or "").lower().replace("_", " ").split()))
+
+    def load_light(self, zd: "Zendesk") -> None:
+        """The Light Agent Assignee field's options, matched to agents by name."""
+        try:
+            f = zd.get(f"/api/v2/ticket_fields/{LIGHT_FIELD}.json").get("ticket_field", {})
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return                                 # the field is gone: assignees count as they are
+            raise
+        for o in f.get("custom_field_options", []):
+            z = self.agent_named(o.get("name"))
+            if z is not None:
+                self.light[str(o.get("value"))] = z
+
+    def light_agent(self, value) -> int | None:
+        """The light agent a field value names; an option removed since still names the person in its tag (la_first_last)."""
+        if not value:
+            return None
+        z = self.light.get(str(value))
+        if z is None and str(value).startswith("la_"):
+            z = self.agent_named(str(value)[3:])
+        return z
+
+    def owner(self, assignee, light) -> int | None:
+        """Whose ticket it is: the light agent when the field is set, else the assignee."""
+        z = self.light_agent(light)
+        return z if z is not None else assignee
 
     def staff(self, zid) -> str | None:
         """Account of a staff member (never of a client); remembers the name for jira_people."""
@@ -234,9 +269,19 @@ def build(t: dict, audits: list[dict], people: ZPeople, statuses: dict, delivere
         label = MERGED
     resolved = done(label, cat)
     events, comments = [], []
+    held = {"assignee_id": None, str(LIGHT_FIELD): None}          # as the audits set them, the skipped ones included
     for a in sorted(audits, key=lambda a: (a.get("created_at") or "", a["id"])):
         at = ts(a.get("created_at"))
         via = a.get("via") or {}
+        before = people.owner(held["assignee_id"], held[str(LIGHT_FIELD)])
+        moved = False
+        for e in a.get("events", []):
+            fn = str(e.get("field_name"))
+            if fn in held and e.get("type") in ("Create", "Change"):
+                v = e.get("value")
+                held[fn] = (int(v) if v not in (None, "") else None) if fn == "assignee_id" else (v or None)
+                moved = moved or e.get("type") == "Change"
+        after = people.owner(held["assignee_id"], held[str(LIGHT_FIELD)])
         if at is None or (migrated and via.get("channel") in SKIP_ON_MIGRATED):
             continue                                   # the migration's own steps are not work anybody did
         merge = ((via.get("source") or {}).get("rel") == "merge")
@@ -272,10 +317,8 @@ def build(t: dict, audits: list[dict], people: ZPeople, statuses: dict, delivere
                 add("status", f_l, t_l)
             if f_c and t_c and done(f_l, f_c) != done(t_l, t_c):        # delivered or reopened: as Jira's resolution
                 add("resolution", f_l if done(f_l, f_c) else None, t_l if done(t_l, t_c) else None)
-        if "assignee_id" in changed:
-            e = changed["assignee_id"]
-            fz, tz = e.get("previous_value"), e.get("value")
-            fz, tz = (int(fz) if fz not in (None, "") else None), (int(tz) if tz not in (None, "") else None)
+        if moved and before != after:                  # the owner changed (assignee or light agent)
+            fz, tz = before, after
             fa, ta = people.staff(fz), people.staff(tz)
             fu, tu = people.team.get(fa), people.team.get(ta)
             add("assignee", people.names.get(fu) if fu else ("other" if fz else None),
@@ -291,11 +334,13 @@ def build(t: dict, audits: list[dict], people: ZPeople, statuses: dict, delivere
                                  "created_at": at, "is_public": bool(e.get("public", True)),
                                  "author_account": people.staff(e.get("author_id")), "source": "zendesk"})
 
-    acc = people.staff(t.get("assignee_id"))
+    light = next((c.get("value") for c in t.get("custom_fields", []) if c.get("id") == LIGHT_FIELD), None)
+    owner = people.owner(t.get("assignee_id"), light)
+    acc = people.staff(owner)
     a_uid = people.team.get(acc) if acc else None
     row = {"ticket_id": tid, "jira_key": key, "zendesk_id": zid, "summary": (t.get("subject") or key).strip()[:500],
            "priority": PRIORITY.get(t.get("priority") or "", "Medium"), "assignee_id": a_uid,
-           "assignee_name": None if a_uid or not t.get("assignee_id") else people.agents.get(int(t["assignee_id"]), "other"),
+           "assignee_name": None if a_uid or not owner else people.agents.get(int(owner), "other"),
            "assignee_account": acc, "organization": orgs.get(t.get("organization_id")),
            "state": "Closed" if resolved else "Open", "jira_status": label, "status_category": CATEGORY.get(cat),
            "resolution": label if resolved else None, "updated_at": ts(t.get("updated_at")), "synced_at": dt.datetime.now(UTC)}
@@ -390,6 +435,7 @@ def run_sync(engine: sa.Engine, zd: Zendesk, mode: str = "incremental", log=prin
     log(f"signed in to Zendesk as {me.get('name', '?')}")
     started = dt.datetime.now(UTC)
     people = ZPeople(engine, store, zd)
+    people.load_light(zd)
     statuses = _status_names(zd)
     tk = store.t["tickets"]
     with engine.connect() as c:

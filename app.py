@@ -1,6 +1,6 @@
 """Daily module - team dashboard on Supabase.
 
-Tabs: Tickets and Ticket health (Jira), Deliverables (projects, deliverables.py), Manage (admin only).
+Tabs: Tickets and Ticket health (Zendesk since November 2026, Jira history before), Deliverables (projects, deliverables.py), Manage (admin only).
 Sign-in:            accounts and roles (admin / manager / user) from [users.<username>] blocks in the secrets.
 
 Configuration lives in .streamlit/secrets.toml (see secrets.toml.example):
@@ -29,8 +29,8 @@ import deliverables as DL
 import ticket_flow as TF
 import ticket_kpis as KPI
 
-AUTO_SYNC_AFTER_MIN = 30                                      # catch up from Jira when the data is older than this
-APP_BUILD = "2026-10-09 d"                                   # shown in Jira diagnosis: tells which code is live
+AUTO_SYNC_AFTER_MIN = 30                                      # catch up from Zendesk when the data is older than this
+APP_BUILD = "2026-11-05 zendesk"                             # shown by Check connection: tells which code is live
 
 st.set_page_config(page_title="Daily module", layout="centered")
 
@@ -43,6 +43,11 @@ def secret(section: str, key: str, default=""):
 
 
 JIRA = str(secret("app", "jira_base_url", "") or secret("jira", "base_url", "") or "https://mydesq.atlassian.net").rstrip("/")
+ZD_SUB = str(secret("zendesk", "subdomain", "") or "").strip()
+ZENDESK = f"https://{ZD_SUB}.zendesk.com" if ZD_SUB else ""
+DL.ZENDESK = ZENDESK                                          # tickets with a Zendesk number open there
+# where new data comes from: Zendesk since November 2026 (the Jira sync is stopped for good)
+SOURCE = "Zendesk" if secret("zendesk", "client_id", "") else ""
 SNAPSHOT = pd.to_datetime(secret("app", "snapshot_date", dt.date.today())).date()
 # Per-person ticket figures (Ticket health people cards, nudge avatars). On unless [app] ticket_people_view = false.
 
@@ -160,18 +165,22 @@ def start_sync(mode: str) -> bool:
     if not state["lock"].acquire(blocking=False):
         return False
     now = dt.datetime.now(dt.timezone.utc)
-    cfg, engine = dict(st.secrets["jira"]), conn().engine
+    try:                                            # loaded here, on the page: the background thread may not find the app folder
+        cfg, engine = dict(st.secrets["zendesk"]), conn().engine
+        from zendesk_sync import Zendesk as Client, run_sync
+    except Exception as e:  # noqa: BLE001 - shown in Manage; the page itself goes on
+        state.update(last_try=now, outcome=("error", f"The sync could not start: {str(e).splitlines()[0][:200] if str(e) else type(e).__name__}", now))
+        state["lock"].release()
+        return False
     state.update(running=mode, started=now, last_try=now, progress="starting")
 
     def log(m: str) -> None:
         state["progress"] = m.strip()
 
     def work():
-        from jira_client import Jira
-        from jira_sync import run_sync
         done = False
         try:
-            res = run_sync(engine, Jira.from_mapping(cfg), mode, log=log)
+            res = run_sync(engine, Client.from_mapping(cfg), mode, log=log)
             p = res.get("partial")
             state["outcome"] = (("warning", f"Jira returned only {p['returned']} tickets against {p['stored']} stored, so the others "
                                             "were left as they are. Press Check connection.") if p else
@@ -192,9 +201,9 @@ def start_sync(mode: str) -> bool:
 
 
 def maybe_auto_sync() -> None:
-    """When the data is over AUTO_SYNC_AFTER_MIN minutes old, catch up from Jira in the background
+    """When the data is over AUTO_SYNC_AFTER_MIN minutes old, catch up from Zendesk in the background
     (at most one try every 15 minutes, never while another sync runs)."""
-    if not secret("jira", "api_token", ""):
+    if not SOURCE:
         return
     last = last_sync_at()
     now = dt.datetime.now(dt.timezone.utc)
@@ -204,7 +213,7 @@ def maybe_auto_sync() -> None:
     if state["last_try"] and now - state["last_try"] < dt.timedelta(minutes=15):
         return
     if start_sync("incremental"):
-        st.toast("Fetching the latest Jira changes in the background.")
+        st.toast(f"Fetching the latest {SOURCE} changes in the background.")
 
 
 def jira_diag() -> dict:
@@ -227,34 +236,31 @@ def jira_diag() -> dict:
     return out
 
 
-def jira_check_connection() -> tuple[list[tuple[str, str]], str, str]:
-    """Read-only diagnosis: the live code version, the [jira] secrets described without the token
-    (compare with check_setup.py on the PC that works), and Jira's raw answers. Returns rows, verdict, level."""
-    from jira_client import Jira, describe_config
-    cfg = st.secrets["jira"]
-    rows = [("App version", APP_BUILD)] + [(f"[jira] {k}", str(v)) for k, v in describe_config(cfg).items()]
-    j = Jira.from_mapping(cfg)
-    me = j.probe("/rest/api/3/myself")
-    who = me["body"].get("displayName")
-    rows.append(("Jira sign-in (/myself)", f"HTTP {me['status']}" + (f" - {me['login']}" if me["login"] else "")
-                 + (f" - signed in as {who}" if who else "")))
-    if me["status"] != 200:
-        return rows, ("Jira does not accept this email and token. Compare the fingerprints above with the ones check_setup.py "
-                      "prints on the PC where the sync works: the line that differs is the one to fix in the Streamlit secrets."), "error"
-    n_all = j.probe("/rest/api/3/search/approximate-count", jql=f"project = {j.project}")
-    rows.append((f"{j.project} tickets visible", f"{n_all['body'].get('count')} (HTTP {n_all['status']})"))
-    accounts = query("select jira_account_id from users where jira_account_id is not null")
-    ids = ",".join(f'"{a}"' for a in accounts["jira_account_id"])
-    if not ids:
-        return rows, "No team member is linked to a Jira account: run section 1 of supabase_jira_sync.sql.", "warning"
-    n_team = j.probe("/rest/api/3/search/approximate-count",
-                     jql=f"project = {j.project} AND (assignee in ({ids}) OR assignee was in ({ids}))")
-    rows.append((f"Team tickets visible ({len(accounts)} linked people)", f"{n_team['body'].get('count')} (HTTP {n_team['status']})"))
-    if not n_all["body"].get("count"):
-        return rows, f"Signed in as {who}, but this account cannot see {j.project}. Use the account that can open it.", "error"
-    if not n_team["body"].get("count"):
-        return rows, "The account sees the project but none of the team's tickets: check users.jira_account_id.", "warning"
-    return rows, "The connection is fine. Press Full re-sync.", "success"
+def zendesk_check_connection() -> tuple[list[tuple[str, str]], str, str]:
+    """Read-only diagnosis for Zendesk: the live code version, the OAuth sign-in, what the client can see and how many
+    people are linked to their Zendesk agent. Never shows the client secret. Returns rows, verdict, level."""
+    from zendesk_sync import Zendesk
+    cfg = st.secrets["zendesk"]
+    z = Zendesk.from_mapping(cfg)
+    rows = [("App version", APP_BUILD), ("[zendesk] subdomain", str(cfg.get("subdomain", ""))),
+            ("[zendesk] client_id", str(cfg.get("client_id", ""))),
+            ("[zendesk] client_secret", "set" if str(cfg.get("client_secret", "")).strip() else "missing")]
+    z.token()
+    rows.append(("OAuth sign-in", "ok (read-only)"))
+    me = z.get("/api/v2/users/me.json").get("user", {})
+    rows.append(("Acts as", f"{me.get('name', '?')} ({me.get('role', '?')})"))
+    n = z.get("/api/v2/tickets/count.json").get("count", {}).get("value")
+    rows.append(("Tickets visible", str(n)))
+    try:
+        linked = int(query("select count(*) from users where zendesk_user_id is not null").iloc[0, 0])
+    except Exception:  # noqa: BLE001 - before supabase_zendesk.sql
+        return rows, "Run supabase_zendesk.sql in Supabase, then press Full re-sync.", "warning"
+    rows.append(("People linked to their Zendesk agent", str(linked)))
+    if me.get("role") not in ("admin", "agent"):
+        return rows, "The OAuth client does not act as an agent or admin: ask the Zendesk admin to create it from an admin account.", "error"
+    if not n:
+        return rows, "Signed in, but no ticket is visible: the OAuth client's admin needs access to the team's tickets.", "error"
+    return rows, "The connection is fine.", "success"
 
 
 @st.cache_data(show_spinner=False)
@@ -291,6 +297,32 @@ def ticket_lines(sync_key: str) -> dict[int, str]:
         if parts:
             out[tid] = " \u00b7 ".join(parts)
     return out
+
+
+@st.cache_data(show_spinner=False)
+def _zendesk_ids(sync_key: str) -> dict:
+    """Ticket key -> Zendesk number, for links and labels."""
+    z = query("select jira_key, zendesk_id from tickets where zendesk_id is not null")
+    return {str(k): int(v) for k, v in zip(z["jira_key"], z["zendesk_id"])}
+
+
+def zendesk_ids() -> dict:
+    try:
+        return _zendesk_ids(globals().get("SYNC_KEY", ""))
+    except Exception:  # noqa: BLE001 - before supabase_zendesk.sql, or a database hiccup (not cached: tried again next time)
+        return {}
+
+
+def tlink(key, ids: dict | None = None) -> str:
+    """A ticket's address: Zendesk when it is there, else its old Jira page."""
+    return DL.ticket_url(JIRA, key, (zendesk_ids() if ids is None else ids).get(str(key)))
+
+
+def tlabel(key, ids: dict | None = None) -> str:
+    return DL.ticket_label(key, (zendesk_ids() if ids is None else ids).get(str(key)))
+
+
+LINK_TEXT = r".*/(?:browse|tickets)/([^/?#]+)"                 # a link column shows the key, or the Zendesk number
 
 
 def load_tickets() -> tuple[pd.DataFrame, dt.date]:
@@ -460,7 +492,7 @@ PRIO_LEGEND = [("Critical", "#fcebeb"), ("High", "#faeeda"), ("Medium", "var(--s
 
 def render_tickets(t: pd.DataFrame, total_in_scope: int, report_date: dt.date, admin: bool = False) -> str:
     h = ['<div class="dm">']
-    h.append(f'<div class="top"><span class="h1">Tickets</span><span class="muted">from Jira &middot; as of {report_date.strftime("%a %d %b %Y")} &middot; {plural(total_in_scope, "ticket")} in scope</span></div>')
+    h.append(f'<div class="top"><span class="h1">Tickets</span><span class="muted">from {SOURCE or "Jira"} &middot; as of {report_date.strftime("%a %d %b %Y")} &middot; {plural(total_in_scope, "ticket")} in scope</span></div>')
 
     hot = int(t["priority"].isin(["Critical", "Highest", "High"]).sum())
     old = int((t["age"] > 90).sum())
@@ -503,12 +535,13 @@ def tickets_table(show: pd.DataFrame, jira: str, lines: dict[int, str] | None = 
     h.append(f'<p class="h2" style="margin-top:20px">Tickets &middot; {len(show)}</p>')
     h.append('<table class="tbl"><colgroup><col style="width:62px"><col><col style="width:116px"><col style="width:138px"><col style="width:92px"><col style="width:50px"></colgroup>')
     h.append('<thead><tr><th>No.</th><th>Summary</th><th>Status</th><th>Assignee</th><th>Created</th><th class="r">Age</th></tr></thead><tbody>')
+    ids = zendesk_ids()
     for _, r in show.iterrows():
         tint = PRIO_TINT.get(r["priority"], "")
         style = f' style="background:{tint}"' if tint else ""
-        num = esc(r["number"])
+        num = esc(tlabel(r["key"], ids)) if str(r["key"]) in ids else esc(r["number"])
         if jira:
-            num = f'<a href="{esc(jira)}/browse/{esc(r["key"])}" target="_blank">{num}</a>'
+            num = f'<a href="{esc(tlink(r["key"], ids))}" target="_blank">{num}</a>'
         created = r["created"].strftime("%d/%m/%Y") if is_date(r["created"]) else ""
         status = str(r.get("jira_status", "") or "") or ("Closed" if str(r.get("state", "")) == "Closed" else "Open")
         done = str(r.get("state", "")) == "Closed"
@@ -772,7 +805,7 @@ def flow_model(sync_key: str) -> dict | None:
     """Who received, resolved and holds which ticket (ticket_flow.py); rebuilt once per sync."""
     try:
         t = query("select ticket_id, created_at, resolved_at, resolution, assignee_account, closed_assignee_account "
-                  "from tickets where jira_key is not null")
+                  "from tickets where jira_key is not null and coalesce(jira_status, '') <> 'Deleted in Zendesk'")
         e = query("select ticket_id, at, history_id, item_no, field, from_account, to_account from jira_events where field = 'assignee'")
     except Exception:  # noqa: BLE001 - before supabase_ticket_people.sql
         return None
@@ -785,7 +818,8 @@ def health_model(sync_key: str) -> dict | None:
     """Rebuilt once per sync (sync_key changes when new data arrives). Returns None before the Jira tables exist."""
     # The sync stores every MYDSUP ticket; Ticket health looks at the tickets people linked to Jira handle
     # (assigned to one of them now, or ever handed to or from one of them), plus every open ticket.
-    scope = """select t.ticket_id from tickets t where t.jira_key is not null and (t.assignee_id is not null or t.resolution is null
+    scope = """select t.ticket_id from tickets t where t.jira_key is not null and coalesce(t.jira_status, '') <> 'Deleted in Zendesk'
+                   and (t.assignee_id is not null or t.resolution is null
                    or t.jira_status in (select status from jira_status_map where not delivered) or exists (
                    select 1 from jira_events e where e.ticket_id = t.ticket_id and e.field = 'assignee'
                    and (e.to_user_id is not null or e.from_user_id is not null)))"""
@@ -966,6 +1000,7 @@ def render_health(model: dict, label: str, months: list[pd.Period], today: dt.da
     if not len(nd):
         h.append('<p class="sec" style="margin-top:8px">Nothing is sitting quietly.</p>')
     rows = []
+    ids = zendesk_ids()
     for r in nd.itertuples():
         tags = "".join(f'<span class="tg">{esc(x)}</span>' for x in r.tags.split(", ") if x)
         who = ""
@@ -978,7 +1013,7 @@ def render_health(model: dict, label: str, months: list[pd.Period], today: dt.da
         tip = f'last public update {r.public_bd:.0f} business days ago' if pd.notna(r.public_bd) else "no public update yet"
         col = "#a32d2d" if r.ratio >= 2 else "var(--t2)"
         rows.append(f'<div class="li"><i style="background:{KPI.SIDE_COLOR.get(r.side, "#b4b2a9")}"></i>'
-                    f'<span class="t" title="{esc(r.summary)}">{who}{tags}<a href="{esc(JIRA)}/browse/{esc(r.key)}" target="_blank">{esc(r.key.split("-")[-1])}</a> {esc(r.summary)}</span>'
+                    f'<span class="t" title="{esc(r.summary)}">{who}{tags}<a href="{esc(tlink(r.key, ids))}" target="_blank">{esc(tlabel(r.key, ids) if tlabel(r.key, ids) != r.key else r.key.split("-")[-1])}</a> {esc(r.summary)}</span>'
                     f'<span class="m">{esc(r.priority)} &middot; {esc(r.status)}</span><span class="r" style="color:{col}" title="{esc(tip)}">quiet {r.quiet_bd:.0f} d</span></div>')
     h.extend(rows[:12])
     if len(rows) > 12:
@@ -1436,7 +1471,7 @@ def project_actions(mine: pd.DataFrame) -> None:
             s1, s2 = st.columns(2)
             start = s1.date_input("Start", value=today, format="DD/MM/YYYY")
             due = s2.date_input("Due date (final)", value=None, min_value=today, format="DD/MM/YYYY")
-            key = st.text_input("Ticket (optional)", placeholder="MYDSUP-15908")
+            key = st.text_input("Ticket (optional)", placeholder="Zendesk number, e.g. 316")
             if st.form_submit_button("Add", type="primary", width="stretch"):
                 _project_done("Pick a due date." if due is None else DL.add(conn(), USER_ID, title, start, due, key, ACCOUNT["user"], today),
                               "Project added.")
@@ -1446,7 +1481,7 @@ def project_actions(mine: pd.DataFrame) -> None:
             _project_done(DL.close(conn(), pid, USER_ID, ACCOUNT["user"], today), "Project closed.")
     with c.popover("Link ticket", icon=":material/link:", width="stretch", disabled=unlinked.empty):
         pid = st.selectbox("Project", unlinked["project_id"].tolist(), format_func=lambda x: name_of.get(int(x), str(x)), key="p_link")
-        key = st.text_input("Ticket", placeholder="MYDSUP-15908", key="p_link_key")
+        key = st.text_input("Ticket", placeholder="Zendesk number, e.g. 316", key="p_link_key")
         if st.button("Link", type="primary", width="stretch", key="p_link_go"):
             _project_done(DL.link(conn(), pid, USER_ID, key), "Ticket linked.")
 
@@ -1466,7 +1501,7 @@ def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
     if HAS_REDATE:
         view["Updated due"] = [d if DL.is_date(d) else None for d in op["revised_due"]]
         view["Moves"] = [int(x) for x in op["redates"]]
-    view["Ticket"] = [f"{JIRA}/browse/{k}" if isinstance(k, str) and k else "" for k in op["jira_key"]]
+    view["Ticket"] = [tlink(k) if isinstance(k, str) and k else "" for k in op["jira_key"]]
     if HAS_COMMENT:
         view["Comment"] = [c if isinstance(c, str) else "" for c in op["comment"]]
     config = {"Project": st.column_config.TextColumn("Project", width="medium"),
@@ -1475,7 +1510,7 @@ def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
               "Updated due": st.column_config.DateColumn("Updated due", format="DD/MM/YYYY", min_value=today,
                                                          help="A new due date; every move is logged and counts against keeping commitments"),
               "Moves": st.column_config.NumberColumn("Moves", format="%d", help="How many times the due date was moved"),
-              "Ticket": st.column_config.LinkColumn("Ticket", display_text=r".*/browse/(.*)"),
+              "Ticket": st.column_config.LinkColumn("Ticket", display_text=LINK_TEXT),
               "Comment": st.column_config.TextColumn("Comment", width="large", max_chars=DL.COMMENT_MAX)}
     editable = [c for c in ("Updated due", "Comment") if c in view.columns]
     if not (own and editable and USER_ID is not None):
@@ -1568,23 +1603,27 @@ def tickets_section() -> None:
         mask = [ok and a in f_asg for ok, a in zip(mask, tickets["assignee"])]
     if c_from or c_to:
         mask = [ok and is_date(d) and (not c_from or d >= c_from) and (not c_to or d <= c_to) for ok, d in zip(mask, tickets["created"])]
+    ids = zendesk_ids()
+    tickets["zendesk"] = [ids.get(str(k)) for k in tickets["key"]]
     if q:
+        qn = q.lstrip("#")
         mask = [
-            ok and (q in k.lower() or q in str(n) or all(w in s.lower() for w in q.split()))
-            for ok, k, n, s in zip(mask, tickets["key"], tickets["number"], tickets["summary"])
+            ok and (q in k.lower() or q in str(n) or (z is not None and qn == str(z)) or all(w in s.lower() for w in q.split()))
+            for ok, k, n, z, s in zip(mask, tickets["key"], tickets["number"], tickets["zendesk"], tickets["summary"])
         ]
     sel_t = where(tickets, mask).copy()
 
     st.markdown(CSS + render_tickets(sel_t, len(tickets), report_date, SEE_ALL), unsafe_allow_html=True)
 
     sel_t["_prio"] = [PRIO_ORDER.get(p, 9) for p in sel_t["priority"]]
+    sel_t["_num"] = [int(z) if z is not None and not pd.isna(z) else int(n) for z, n in zip(sel_t["zendesk"], sel_t["number"])]
     sel_t["_created"] = [c if is_date(c) else dt.date(1900, 1, 1) for c in sel_t["created"]]
     order = {
         "Assignee, oldest first": (["assignee", "_created"], [True, True]),
         "Oldest first": (["_created"], [True]),
         "Newest first": (["_created"], [False]),
         "Priority": (["_prio", "_created"], [True, True]),
-        "Number": (["number"], [True]),
+        "Number": (["_num"], [True]),
     }[sort_by]
     show = sel_t.sort_values(by=order[0], ascending=order[1])
     _ls = last_sync_at()
@@ -1592,13 +1631,13 @@ def tickets_section() -> None:
     st.markdown(CSS + tickets_table(show, JIRA, lines), unsafe_allow_html=True)
     show = show.assign(history=[lines.get(int(n), "") for n in show["number"]])
 
-    csv = show[["number", "key", "state", "jira_status", "priority", "summary", "assignee", "team", "created", "age", "history"]].rename(columns={
-        "number": "No.", "key": "Key", "state": "State", "jira_status": "Status", "priority": "Priority", "summary": "Summary",
+    csv = show[["number", "key", "zendesk", "state", "jira_status", "priority", "summary", "assignee", "team", "created", "age", "history"]].rename(columns={
+        "number": "No.", "key": "Key", "zendesk": "Zendesk", "state": "State", "jira_status": "Status", "priority": "Priority", "summary": "Summary",
         "assignee": "Assignee", "team": "Team", "created": "Created", "age": "Age (days)", "history": "Taken, worked, closed",
     })
     c1, c2, c3 = st.columns([3, 1, 1])
     _ls = last_sync_at()
-    c1.caption(f"Source: Jira, synced {_ls.astimezone(KPI.WORK_TZ):%d %b %H:%M}" if _ls else f"Source: Supabase &middot; snapshot {report_date:%d %b %Y}",
+    c1.caption(f"Source: {SOURCE or 'Jira'}, synced {_ls.astimezone(KPI.WORK_TZ):%d %b %H:%M}" if _ls else f"Source: Supabase &middot; snapshot {report_date:%d %b %Y}",
                unsafe_allow_html=True)
     c2.download_button("Download CSV", csv.to_csv(index=False).encode("utf-8-sig"), file_name=f"tickets_{report_date:%Y%m%d}.csv", mime="text/csv", width="stretch", key="t_dl")
     if c3.button("Refresh", width="stretch", key="t_refresh"):
@@ -1609,12 +1648,12 @@ def manage_section() -> None:
     st.caption("Changes go straight to Supabase and appear on the other sections after Save.")
 
     _state = _sync_state()
-    with st.expander("Jira sync", expanded=bool(_state["running"])):
+    with st.expander(f"{SOURCE or 'Ticket'} sync", expanded=bool(_state["running"])):
         _ls = last_sync_at()
         st.caption((f"Last sync {_ls.astimezone(KPI.WORK_TZ):%a %d %b %H:%M}. " if _ls else "Not synced yet. ")
-                   + f"The app fetches the latest Jira changes whenever someone opens it and the data is over {AUTO_SYNC_AFTER_MIN} minutes old.")
-        if not secret("jira", "api_token", ""):
-            st.info("To sync from here, add a [jira] section to the app secrets: base_url, email, api_token, project.")
+                   + f"The app fetches the latest {SOURCE or 'ticket'} changes whenever someone opens it and the data is over {AUTO_SYNC_AFTER_MIN} minutes old.")
+        if not SOURCE:
+            st.info("To sync from here, add a [zendesk] section to the app secrets: subdomain, client_id, client_secret.")
         else:
             j1, j2, j3 = st.columns(3)
             if _state["running"]:
@@ -1623,31 +1662,29 @@ def manage_section() -> None:
                 j1.button("Refresh", key="jira_refresh", width="stretch")
             else:
                 mode = "incremental" if j1.button("Sync changes now", key="jira_inc", width="stretch") else (
-                    "full" if j2.button("Full re-sync (about 15 minutes)", key="jira_full", width="stretch",
-                                        help="Every MYDSUP ticket. Runs in the background.") else None)
+                    "full" if j2.button("Full re-sync", key="jira_full",
+                                        width="stretch", help=f"Every {SOURCE} ticket again. Runs in the background.") else None)
                 if mode:
                     if not start_sync(mode):
                         st.warning("A sync is already running.")
                     st.rerun()
             if j3.button("Check connection", key="jira_check", width="stretch",
-                         help="Read-only: shows which Jira account the secrets use and how many team tickets it can see"):
+                         help=f"Read-only: shows which {SOURCE} account the secrets use and what it can see"):
                 try:
-                    _rows, _verdict, _level = jira_check_connection()
+                    _rows, _verdict, _level = zendesk_check_connection()
                     st.markdown("| Check | Result |\n|---|---|\n" + "\n".join(
                         f"| {esc(a)} | {esc(b)} |" for a, b in _rows))
                     {"error": st.error, "warning": st.warning}.get(_level, st.success)(_verdict)
                 except PermissionError as e:
-                    st.error(f"Jira refused the connection: {str(e).splitlines()[0][:200].rstrip('.')}. "
-                             "Check email and api_token under [jira] in the Streamlit secrets: the token must be an API token "
-                             "created by the Atlassian account with that email, pasted whole, between quotes, without spaces.")
+                    st.error(f"{SOURCE} refused the connection: {str(e).splitlines()[0][:300].rstrip('.')}.")
                 except (Exception, SystemExit) as e:  # noqa: BLE001
                     st.error(f"Check connection failed: {str(e).splitlines()[0][:200].rstrip('.') if str(e) else type(e).__name__}. "
-                             "Check base_url and project under [jira] in the Streamlit secrets.")
+                             f"Check the [{SOURCE.lower()}] section in the Streamlit secrets.")
             _d = jira_diag()
             if isinstance(_d.get("summary"), dict):
                 _sm = _d["summary"]
                 st.caption(f"Last sync: {_sm.get('mode')} &middot; {_sm.get('tickets')} tickets refreshed &middot; {_sm.get('seconds')} s"
-                           f" &middot; {_d.get('synced_tickets')} tickets with Jira data in the database"
+                           f" &middot; {_d.get('synced_tickets')} tickets in the database"
                            + (f" &middot; only {_sm['partial'].get('returned')} of {_sm['partial'].get('stored')} stored tickets came back"
                               if isinstance(_sm.get("partial"), dict) else ""), unsafe_allow_html=True)
             if _state["outcome"] and not _state["running"]:
@@ -1709,7 +1746,7 @@ def manage_tables() -> None:
                 "revised_due": st.column_config.DateColumn("Updated due", format="DD/MM/YYYY",
                                                            help="Every change is logged; the original Due stays the commitment"),
                 "closed_on": st.column_config.DateColumn("Closed", format="DD/MM/YYYY"),
-                "jira_key": st.column_config.TextColumn("Ticket", help="Like MYDSUP-15908"),
+                "jira_key": st.column_config.TextColumn("Ticket", help="The ticket key: ZD-316 for a Zendesk ticket, MYDSUP-15908 for a migrated or old one"),
                 "comment": st.column_config.TextColumn("Comment", width="large", max_chars=DL.COMMENT_MAX),
                 "cancelled": st.column_config.CheckboxColumn("Cancelled", default=False),
                 "created_at": st.column_config.DatetimeColumn("Created", format="DD/MM/YYYY HH:mm"),
@@ -1844,12 +1881,12 @@ def dashboard_section() -> None:
             show = op.merge(tk_all[["number", "key", "summary", "jira_status"]], left_on="ticket_id", right_on="number", how="left")
             show = show.sort_values("age_bd", ascending=False)
             st.dataframe(
-                pd.DataFrame({"Ticket": [f"{JIRA}/browse/{k}" for k in show["key"]], "Summary": show["summary"],
+                pd.DataFrame({"Ticket": [tlink(k) for k in show["key"]], "Summary": show["summary"],
                               "Status": show["jira_status"], "With them since": [x.astimezone(KPI.WORK_TZ).date() for x in show["since"]],
                               "Days held": show["age_bd"].round(0).astype(int),
                               "History": [lines.get(int(t), "") for t in show["ticket_id"]]}),
                 hide_index=True, width="stretch",
-                column_config={"Ticket": st.column_config.LinkColumn("Ticket", display_text=r".*/browse/(.*)"),
+                column_config={"Ticket": st.column_config.LinkColumn("Ticket", display_text=LINK_TEXT),
                                "Summary": st.column_config.TextColumn("Summary", width="large"),
                                "With them since": st.column_config.DateColumn("With them since", format="DD/MM/YYYY"),
                                "Days held": st.column_config.NumberColumn("Days held", help="Business days since they received it")})

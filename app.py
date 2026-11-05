@@ -12,6 +12,7 @@ Configuration lives in .streamlit/secrets.toml (see secrets.toml.example):
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 import hashlib
 import hmac
 import json
@@ -32,7 +33,8 @@ import ticket_kpis as KPI
 AUTO_SYNC_AFTER_MIN = 30                                      # catch up from Zendesk when the data is older than this
 APP_BUILD = "2026-11-05 zendesk"                             # shown by Check connection: tells which code is live
 
-st.set_page_config(page_title="Daily module", layout="centered")
+_LOGO = Path(__file__).parent / "logo.png"                    # the mydesq symbol, shown on the browser tab
+st.set_page_config(page_title="Daily module", page_icon=str(_LOGO) if _LOGO.exists() else None, layout="centered")
 
 def secret(section: str, key: str, default=""):
     """Read [section] key from secrets.toml; tolerate a missing file or key."""

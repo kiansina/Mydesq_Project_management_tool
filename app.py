@@ -1404,6 +1404,7 @@ except Exception:  # noqa: BLE001 - before supabase_projects.sql
 HAS_COMMENT = projects is not None and "comment_at" in projects.columns
 HAS_REDATE = projects is not None and "revised_due" in DL.columns(query)      # supabase_project_redate.sql has run
 ACH = AC.load(query)                                   # None until supabase_achievements.sql has run
+CANDIDATES = DL.load_candidates(query) if SEE_ALL else None   # the waiting list; None until supabase_waiting_list.sql
 # the signed-in person's row in the users table (anyone can keep their own projects)
 USER_ID = next((int(u) for u, n in zip(team["user_id"], names) if ACCOUNT["name"] and n.lower() == ACCOUNT["name"].lower()), None)
 
@@ -1493,7 +1494,8 @@ def project_actions(mine: pd.DataFrame) -> None:
 
 def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
     """Open projects with dates, ticket and comment. On your own projects the Updated due and Comment columns are
-    editable; the original Due never changes and every move of the updated date is logged. Others read the same table."""
+    editable; the original Due never changes and every move of the updated date is logged. The admin also edits Start
+    and Due, on anyone's projects: a new due date is the new commitment (no delay, its moves are cleared)."""
     msg = st.session_state.pop("_cm_msg", None)
     if msg:
         st.success(msg)
@@ -1511,14 +1513,21 @@ def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
         view["Comment"] = [c if isinstance(c, str) else "" for c in op["comment"]]
     config = {"Project": st.column_config.TextColumn("Project", width="medium"),
               "Start": st.column_config.DateColumn("Start", format="DD/MM/YYYY"),
-              "Due": st.column_config.DateColumn("Due", format="DD/MM/YYYY", help="The committed due date: it never changes"),
+              "Due": st.column_config.DateColumn("Due", format="DD/MM/YYYY", help=(
+                  "The committed due date. Changing it (admin only) makes it the new commitment: no delay, moves cleared"
+                  if IS_ADMIN else "The committed due date: it never changes")),
               "Updated due": st.column_config.DateColumn("Updated due", format="DD/MM/YYYY", min_value=today,
                                                          help="A new due date; every move is logged and counts against keeping commitments"),
               "Moves": st.column_config.NumberColumn("Moves", format="%d", help="How many times the due date was moved"),
               "Ticket": st.column_config.LinkColumn("Ticket", display_text=LINK_TEXT),
               "Comment": st.column_config.TextColumn("Comment", width="large", max_chars=DL.COMMENT_MAX)}
     editable = [c for c in ("Updated due", "Comment") if c in view.columns]
-    if not (own and editable and USER_ID is not None):
+    owner_uid = int(op["user_id"].iloc[0])             # one person's projects
+    if IS_ADMIN:
+        editable = ["Start", "Due"] + editable
+    elif not (own and USER_ID is not None):
+        editable = []
+    if not editable:
         st.dataframe(view.drop(columns="project_id"), hide_index=True, width="stretch", key=f"{key}_open", column_config=config)
         return
     # the key follows the projects and what is stored: an unsaved edit never lands on another project, and after a save
@@ -1531,9 +1540,14 @@ def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
                  if DL.clean_comment(c) != DL.clean_comment(was)} if HAS_COMMENT else {})
     dues = ({int(pid): d for pid, d, was in zip(edited["project_id"], edited["Updated due"], view["Updated due"])
              if DL.as_date(d) != DL.as_date(was)} if HAS_REDATE else {})
-    n = len(comments) + len(dues)
+    dates = ({int(pid): (s_, d) for pid, s_, d, s0, d0 in zip(edited["project_id"], edited["Start"], edited["Due"],
+                                                             view["Start"], view["Due"])
+              if DL.as_date(s_) != DL.as_date(s0) or DL.as_date(d) != DL.as_date(d0)} if IS_ADMIN else {})
+    n = len(comments) + len(dues) + len(dates)
     if st.button(f"Save {plural(n, 'change')}" if n else "Save", type="primary", disabled=not n, key=ek + "_save"):
-        err = DL.save_open(conn(), USER_ID, comments, dues, today, ACCOUNT["user"])
+        err = DL.set_dates(conn(), dates, ACCOUNT["user"]) if dates else None
+        if not err and (comments or dues):
+            err = DL.save_open(conn(), owner_uid, comments, dues, today, ACCOUNT["user"])
         if err:
             st.error(err)
             return
@@ -1543,14 +1557,63 @@ def open_projects(mine: pd.DataFrame, own: bool, key: str) -> None:
         st.rerun()
 
 
+def waiting_list() -> None:
+    """Projects nobody is assigned to yet. The admin adds, edits and removes them in the table and gives one to a
+    person (it then becomes their project, with a start and a final due date); managers read the list."""
+    msg = st.session_state.pop("_wl_msg", None)
+    if msg:
+        st.success(msg)
+    c = CANDIDATES
+    _section("Waiting list", plural(len(c), "project"))
+    df = pd.DataFrame({  # explicit types: an empty list must still give text columns the table can edit
+        "candidate_id": pd.Series([int(x) for x in c["candidate_id"]], dtype="int64"),
+        "title": pd.Series([str(x) for x in c["title"]], dtype=object),
+        "note": pd.Series([x if isinstance(x, str) else "" for x in c["note"]], dtype=object),
+        "added": pd.Series(list(c["added"]), dtype=object)})
+    config = {"candidate_id": st.column_config.NumberColumn("ID", width="small"),
+              "title": st.column_config.TextColumn("Project", width="large", required=True, max_chars=200),
+              "note": st.column_config.TextColumn("Note", width="large", max_chars=500),
+              "added": st.column_config.DateColumn("Added", format="DD/MM/YYYY")}
+    if not IS_ADMIN:
+        st.dataframe(df.drop(columns="candidate_id"), hide_index=True, width="stretch", key="wl_view", column_config=config)
+        return
+    if len(df):
+        title_of = dict(zip(df["candidate_id"], df["title"]))
+        with st.popover("Assign to a person", icon=":material/person_add:"):
+            with st.form("wl_assign", border=False):
+                cid = st.selectbox("Project", list(title_of), format_func=lambda x: title_of.get(x, str(x)), key="wl_pick")
+                who = st.selectbox("Person", names, key="wl_person")
+                s1, s2 = st.columns(2)
+                start = s1.date_input("Start", value=today, format="DD/MM/YYYY", key="wl_start")
+                due = s2.date_input("Due date (final)", value=None, min_value=today, format="DD/MM/YYYY", key="wl_due")
+                if st.form_submit_button("Assign", type="primary", width="stretch"):
+                    err = ("Pick a due date." if due is None else
+                           DL.assign_candidate(conn(), cid, USER_OF[who], start, due, ACCOUNT["user"], today, HAS_COMMENT))
+                    if err:
+                        st.error(err)
+                    else:
+                        st.cache_data.clear()
+                        st.session_state["_wl_msg"] = f"Given to {who}: it is now one of their projects."
+                        st.rerun()
+    spec = {"table": "project_candidates", "pk": "candidate_id", "required": ["title"],
+            "kinds": {"candidate_id": "int", "title": "text", "note": "text"},
+            "disabled": ["candidate_id", "added"], "config": config}
+    # the key follows the rows: an unsaved edit never lands on another project
+    editor(spec, df, {}, "ed_wl_" + hashlib.sha256(repr(tuple(df["candidate_id"])).encode()).hexdigest()[:8])
+    st.caption("Add a project in the empty row at the bottom of the table, then Save.")
+
+
 def deliverables_tab() -> None:
     if projects is None:
         st.warning("Run supabase_projects.sql in Supabase to start using projects.")
         return
     view = "Person"
     if SEE_ALL:
-        view = st.segmented_control("View", ["Person", "Team"], default="Person", key="d_view",
-                                    label_visibility="collapsed") or "Person"
+        view = st.segmented_control("View", ["Person", "Team"] + (["Waiting list"] if CANDIDATES is not None else []),
+                                    default="Person", key="d_view", label_visibility="collapsed") or "Person"
+    if view == "Waiting list":
+        waiting_list()
+        return
     if view == "Person":
         me = (ACCOUNT["name"] or "").strip().lower()
         if SEE_ALL:                               # managers and the admin can open anyone's projects

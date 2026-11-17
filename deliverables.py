@@ -16,6 +16,7 @@ import re
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -270,6 +271,80 @@ def clean_comment(value) -> str | None:
         return None
     t = CONTROL.sub("", " ".join(value.split()))
     return t or None
+
+
+def set_dates(conn, changes: dict, by: str) -> str | None:
+    """The admin's own change of start and due dates {project_id: (start, due)}, all or nothing. A new due date is the
+    new commitment: the updated due date and its log of moves go, so the project shows no delay against the old date."""
+    rows = []
+    for pid, (start, due) in changes.items():
+        start, due = as_date(start), as_date(due)
+        if start is None or due is None:
+            return "Start and due date cannot be empty."
+        if due < start:
+            return "The due date must be on or after the start date."
+        rows.append((int(pid), start, due))
+    try:
+        with conn.session as s:
+            pg = s.get_bind().dialect.name == "postgresql"
+            if pg:
+                s.execute(text("select set_config('app.admin', 'on', true)"))
+                s.execute(text("select set_config('app.user', :by, true)"), {"by": by})
+            log = sa_inspect(s.get_bind()).has_table("project_due_changes")
+            for pid, start, due in rows:
+                was = s.execute(text("select due_date from projects where project_id = :p"), {"p": pid}).scalar()
+                if as_date(was) != due:
+                    s.execute(text("update projects set start_date = :s, due_date = :d, revised_due = null where project_id = :p"),
+                              {"s": start, "d": due, "p": pid})
+                    if log:
+                        s.execute(text("delete from project_due_changes where project_id = :p"), {"p": pid})
+                else:
+                    s.execute(text("update projects set start_date = :s where project_id = :p"), {"s": start, "p": pid})
+            s.commit()
+    except SQLAlchemyError as e:
+        return _reason(e)
+    return None
+
+
+def load_candidates(query) -> pd.DataFrame | None:
+    """The waiting list: projects nobody is assigned to yet, oldest first; None before supabase_waiting_list.sql."""
+    try:
+        df = query("select candidate_id, title, note, created_at, created_by from project_candidates "
+                   "order by created_at, candidate_id")
+    except Exception:  # noqa: BLE001 - table not there yet
+        return None
+    df["note"] = pd.Series([clean_comment(x) for x in df["note"]], index=df.index, dtype=object)
+    df["added"] = pd.Series([_local_date(t) for t in df["created_at"]], index=df.index, dtype=object)
+    return df
+
+
+def assign_candidate(conn, candidate_id: int, user_id: int, start, due, by: str, today: dt.date,
+                     with_comment: bool = True) -> str | None:
+    """Give a waiting project to a person: it becomes their project with this start and (final) due date, its note
+    becomes the project's comment, and it leaves the waiting list. In one go."""
+    start, due = as_date(start), as_date(due)
+    if start is None or due is None:
+        return "Pick the start and the due date."
+    if due < today:
+        return "Due date cannot be in the past."
+    if due < start:
+        return "The due date must be on or after the start date."
+    try:
+        with conn.session as s:
+            if s.get_bind().dialect.name == "postgresql":
+                s.execute(text("select set_config('app.admin', 'on', true)"))
+            c = s.execute(text("select title, note from project_candidates where candidate_id = :c"), {"c": int(candidate_id)}).first()
+            if c is None:
+                return "This project is no longer on the waiting list."
+            cols = "user_id, title, start_date, due_date, created_by" + (", comment" if with_comment else "")
+            vals = ":u, :t, :s, :d, :by" + (", :n" if with_comment else "")
+            s.execute(text(f"insert into projects ({cols}) values ({vals})"),
+                      {"u": int(user_id), "t": c[0], "s": start, "d": due, "by": by, "n": clean_comment(c[1])})
+            s.execute(text("delete from project_candidates where candidate_id = :c"), {"c": int(candidate_id)})
+            s.commit()
+    except SQLAlchemyError as e:
+        return _reason(e)
+    return None
 
 
 def set_comments(conn, user_id: int, changes: dict) -> str | None:

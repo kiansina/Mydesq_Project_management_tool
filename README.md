@@ -131,6 +131,11 @@ again, run `supabase_project_comment.sql` again after it.
   Below the timeline, **Open projects** lists start, due, ticket and comment; on your own projects the
   Comment column is editable (type, then Save).
 * The admin edits, cancels or deletes in Manage > Projects, comments included. Cancelled projects never count.
+* The admin can also change Start and Due in the Open projects table, on anyone's projects. A due date changed by the
+  admin is the new commitment: the updated due date and its moves are cleared, so the project shows no delay.
+* **Waiting list** (Deliverables > Waiting list, managers and admin): projects nobody is assigned to yet. The admin adds,
+  edits and removes them, and assigns one to a person with a start and a final due date; it then becomes their project
+  (its note becomes the comment). Run `supabase_waiting_list.sql` once.
 * **My projects**: open, overdue, kept % and closed late, plus a start-to-due timeline (red tail = days past due).
 * **Team** (managers and admin): the same tiles, Keeping commitments (one square per closed or past-due project),
   On their plate (open projects next to open tickets), Due by week, the overdue list (with each comment) and an
